@@ -41,6 +41,7 @@ func TestFileToEntry(t *testing.T) {
 		ID:            "file-id",
 		Name:          "movie.mp4",
 		Kind:          "drive#file",
+		Hash:          "hash-value",
 		Size:          "12345",
 		ThumbnailLink: "https://thumbnail.example/movie.jpg",
 		ModifiedTime:  mod,
@@ -68,6 +69,9 @@ func TestFileToEntry(t *testing.T) {
 	}
 	if got.ThumbnailURL != "https://thumbnail.example/movie.jpg" {
 		t.Fatalf("thumbnail = %q, want remote thumbnail", got.ThumbnailURL)
+	}
+	if got.Hash != "hash-value" {
+		t.Fatalf("hash = %q, want hash-value", got.Hash)
 	}
 	if !got.ModTime.Equal(mod) {
 		t.Fatalf("mod time = %v, want %v", got.ModTime, mod)

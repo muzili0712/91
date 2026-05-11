@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { AppShell } from "@/components/AppShell";
 import { PromoStrip } from "@/components/PromoStrip";
@@ -12,24 +12,46 @@ import { fetchListing } from "@/data/videos";
 import type { SortKey, VideoItem } from "@/types";
 
 const PAGE_SIZE = 24;
+const LISTING_STATE_PREFIX = "video-site:list-state:";
+
+type ListingState = {
+  sort: SortKey;
+  view: ViewMode;
+  page: number;
+  scrollY: number;
+};
 
 export default function ListingPage() {
   const [params] = useSearchParams();
   const keyword = params.get("q") ?? "";
   const tag = params.get("tag") ?? "";
   const cat = params.get("cat") ?? "";
+  const listKey = useMemo(
+    () => listingStateKey({ keyword, tag, cat }),
+    [keyword, tag, cat]
+  );
+  const initialState = useMemo(() => readListingState(listKey), [listKey]);
+  const activeListKeyRef = useRef(listKey);
+  const pendingScrollYRef = useRef<number | null>(
+    initialState ? initialState.scrollY : null
+  );
 
-  const [sort, setSort] = useState<SortKey>("latest");
-  const [view, setView] = useState<ViewMode>("grid");
-  const [page, setPage] = useState(1);
+  const [sort, setSort] = useState<SortKey>(initialState?.sort ?? "latest");
+  const [view, setView] = useState<ViewMode>(initialState?.view ?? "grid");
+  const [page, setPage] = useState(initialState?.page ?? 1);
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<VideoItem[]>([]);
   const [total, setTotal] = useState(0);
 
-  // 筛选条件变更时回到第一页
   useEffect(() => {
-    setPage(1);
-  }, [keyword, tag, cat, sort]);
+    if (activeListKeyRef.current === listKey) return;
+    activeListKeyRef.current = listKey;
+    const saved = readListingState(listKey);
+    setSort(saved?.sort ?? "latest");
+    setView(saved?.view ?? "grid");
+    setPage(saved?.page ?? 1);
+    pendingScrollYRef.current = saved ? saved.scrollY : 0;
+  }, [listKey]);
 
   useEffect(() => {
     document.title = keyword
@@ -53,6 +75,50 @@ export default function ListingPage() {
     };
   }, [keyword, tag, cat, sort, page]);
 
+  useEffect(() => {
+    const previous = window.history.scrollRestoration;
+    window.history.scrollRestoration = "manual";
+    return () => {
+      window.history.scrollRestoration = previous;
+    };
+  }, []);
+
+  useEffect(() => {
+    let frame = 0;
+    const save = () => {
+      writeListingState(listKey, { sort, view, page, scrollY: window.scrollY });
+    };
+    const saveOnScroll = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        save();
+      });
+    };
+
+    window.addEventListener("scroll", saveOnScroll, { passive: true });
+    window.addEventListener("pagehide", save);
+    save();
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      window.removeEventListener("scroll", saveOnScroll);
+      window.removeEventListener("pagehide", save);
+      save();
+    };
+  }, [listKey, sort, view, page]);
+
+  useEffect(() => {
+    if (loading) return;
+    const scrollY = pendingScrollYRef.current;
+    if (scrollY === null) return;
+    pendingScrollYRef.current = null;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        window.scrollTo({ top: scrollY, behavior: "auto" });
+      });
+    });
+  }, [loading, items.length, listKey]);
+
   const title = keyword
     ? `搜索结果：${keyword}`
     : tag
@@ -74,8 +140,15 @@ export default function ListingPage() {
         <SortToolbar
           sort={sort}
           view={view}
-          onSortChange={setSort}
-          onViewChange={setView}
+          onSortChange={(nextSort) => {
+            pendingScrollYRef.current = 0;
+            setSort(nextSort);
+            setPage(1);
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+          onViewChange={(nextView) => {
+            setView(nextView);
+          }}
         />
         <VideoGrid
           videos={items}
@@ -89,11 +162,62 @@ export default function ListingPage() {
           pageSize={PAGE_SIZE}
           total={total}
           onChange={(p) => {
+            pendingScrollYRef.current = 0;
             setPage(p);
             window.scrollTo({ top: 0, behavior: "smooth" });
           }}
         />
       </div>
     </AppShell>
+  );
+}
+
+function listingStateKey(filters: {
+  keyword: string;
+  tag: string;
+  cat: string;
+}): string {
+  const params = new URLSearchParams();
+  if (filters.keyword) params.set("q", filters.keyword);
+  if (filters.tag) params.set("tag", filters.tag);
+  if (filters.cat) params.set("cat", filters.cat);
+  return `${LISTING_STATE_PREFIX}${params.toString()}`;
+}
+
+function readListingState(key: string): ListingState | null {
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<ListingState>;
+    return {
+      sort: isSortKey(value.sort) ? value.sort : "latest",
+      view: value.view === "compact" ? "compact" : "grid",
+      page: typeof value.page === "number" && value.page > 0 ? value.page : 1,
+      scrollY:
+        typeof value.scrollY === "number" && value.scrollY > 0
+          ? value.scrollY
+          : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeListingState(key: string, state: ListingState) {
+  try {
+    window.sessionStorage.setItem(key, JSON.stringify(state));
+  } catch {
+    // Storage can be unavailable in private browsing modes.
+  }
+}
+
+function isSortKey(value: unknown): value is SortKey {
+  return (
+    value === "latest" ||
+    value === "hot" ||
+    value === "week" ||
+    value === "long" ||
+    value === "hd" ||
+    value === "featured"
   );
 }

@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,7 +19,6 @@ import (
 
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
-	"github.com/video-site/backend/internal/fixedtags"
 	"github.com/video-site/backend/internal/proxy"
 )
 
@@ -88,7 +89,9 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 		r.Get("/api/home", s.handleHome)
 		r.Get("/api/list", s.handleList)
 		r.Get("/api/video/{id}", s.handleVideoDetail)
+		r.Put("/api/video/{id}/tags", s.handleUpdateVideoTags)
 		r.Post("/api/video/{id}/like", s.handleLike)
+		r.Post("/api/video/{id}/hide", s.handleHideVideo)
 		r.Get("/api/tags", s.handleTags)
 
 		// 代理路由同样需要鉴权，防止绕过
@@ -147,6 +150,10 @@ func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
+	if v.Hidden {
+		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
+		return
+	}
 	related, _, _ := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
 		Sort: "hot", Page: 1, PageSize: 8,
 	})
@@ -170,7 +177,7 @@ func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.Catalog.CountTags(r.Context(), fixedtags.Labels)
+	stats, err := s.Catalog.ListTags(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -187,6 +194,33 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+type updateVideoTagsReq struct {
+	Tags []string `json:"tags"`
+}
+
+func (s *Server) handleUpdateVideoTags(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body updateVideoTagsReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.Catalog.SetManualVideoTags(r.Context(), id, body.Tags); err != nil {
+		if errors.Is(err, catalog.ErrUnknownTag) {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	v, err := s.Catalog.GetVideo(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, mapVideo(v))
+}
+
 func (s *Server) handleLike(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	likes, err := s.Catalog.IncrementLike(r.Context(), id)
@@ -195,6 +229,19 @@ func (s *Server) handleLike(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"likes": likes})
+}
+
+func (s *Server) handleHideVideo(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := s.Catalog.HideVideo(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -388,7 +435,7 @@ func mapVideo(v *catalog.Video) VideoDTO {
 		Title:           v.Title,
 		Thumbnail:       thumbnailURL(v),
 		PreviewSrc:      "/p/preview/" + v.ID,
-		PreviewDuration: 10,
+		PreviewDuration: 12,
 		PreviewStrategy: "teaser-file",
 		Duration:        formatDuration(v.DurationSeconds),
 		Badges:          badges,

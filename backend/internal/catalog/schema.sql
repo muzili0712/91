@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS videos (
     id               TEXT PRIMARY KEY,          -- <drive>-<fileID> 拼接的稳定 ID
     drive_id         TEXT NOT NULL,
     file_id          TEXT NOT NULL,
+    content_hash     TEXT DEFAULT '',
     parent_id        TEXT,
     title            TEXT NOT NULL,
     author           TEXT,
@@ -21,6 +22,8 @@ CREATE TABLE IF NOT EXISTS videos (
     likes            INTEGER DEFAULT 0,
     dislikes         INTEGER DEFAULT 0,
     category         TEXT,
+    hidden           INTEGER DEFAULT 0,          -- 1 = hidden from public display
+    tags_manual      INTEGER DEFAULT 0,          -- 1 = user explicitly curated tags
     badges           TEXT,                      -- JSON array
     description      TEXT,
     published_at     INTEGER NOT NULL,          -- unix ms
@@ -32,10 +35,31 @@ CREATE INDEX IF NOT EXISTS idx_videos_drive ON videos(drive_id, file_id);
 CREATE INDEX IF NOT EXISTS idx_videos_pub   ON videos(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_videos_views ON videos(views DESC);
 
+-- 统一标签池
+CREATE TABLE IF NOT EXISTS tags (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    label      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    aliases    TEXT NOT NULL DEFAULT '[]',       -- JSON array
+    source     TEXT NOT NULL DEFAULT 'user',     -- system / user / collection / legacy
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS video_tags (
+    video_id   TEXT NOT NULL,
+    tag_id     INTEGER NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'auto',     -- auto / manual / legacy
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (video_id, tag_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_tags_tag ON video_tags(tag_id);
+CREATE INDEX IF NOT EXISTS idx_video_tags_video ON video_tags(video_id);
+
 -- 网盘账户
 CREATE TABLE IF NOT EXISTS drives (
     id            TEXT PRIMARY KEY,
-    kind          TEXT NOT NULL,                -- quark / p115 / pikpak / wopan
+    kind          TEXT NOT NULL,                -- quark / p115 / pikpak / wopan / onedrive
     name          TEXT NOT NULL,
     root_id       TEXT NOT NULL DEFAULT '0',
     scan_root_id  TEXT,                          -- 扫描起点（默认 root_id）

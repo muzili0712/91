@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/video-site/backend/internal/catalog"
 )
 
@@ -78,7 +80,7 @@ func TestTranscodeTempPathKeepsMp4Extension(t *testing.T) {
 	}
 }
 
-func TestHandleTagsReturnsFixedTagsOnly(t *testing.T) {
+func TestHandleTagsReturnsUnifiedTagPool(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -94,14 +96,17 @@ func TestHandleTagsReturnsFixedTagsOnly(t *testing.T) {
 		ID:          "video-1",
 		DriveID:     "drive",
 		FileID:      "file-1",
-		Title:       "女大后入",
-		Tags:        []string{"后入", "女大", "sunny"},
+		Title:       "清纯女大后入",
+		Tags:        []string{"后入", "女大"},
 		Category:    "random-category",
 		PublishedAt: now,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+		t.Fatalf("create tag: %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/tags", nil)
@@ -123,12 +128,170 @@ func TestHandleTagsReturnsFixedTagsOnly(t *testing.T) {
 	for _, tag := range got {
 		labels = append(labels, tag.Label)
 	}
-	want := []string{"后入", "奶子", "口交", "臀", "人妻", "女大"}
-	if !sameStrings(labels, want) {
-		t.Fatalf("labels = %#v, want %#v", labels, want)
+	if !containsString(labels, "清纯") {
+		t.Fatalf("labels = %#v, want user tag 清纯", labels)
 	}
-	if got[0].Count != 1 || got[5].Count != 1 {
-		t.Fatalf("counts = %#v, want 后入 and 女大 count 1", got)
+	if !containsString(labels, "后入") {
+		t.Fatalf("labels = %#v, want system tag 后入", labels)
+	}
+	var qingchunCount int
+	for _, tag := range got {
+		if tag.Label == "清纯" {
+			qingchunCount = tag.Count
+		}
+	}
+	if qingchunCount != 1 {
+		t.Fatalf("清纯 count = %d, want 1; tags = %#v", qingchunCount, got)
+	}
+}
+
+func TestHandleUpdateVideoTagsRejectsUnknownTags(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "video-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		Title:       "普通标题",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+
+	req := requestWithVideoID(http.MethodPut, "/api/video/video-1/tags", "video-1", strings.NewReader(`{"tags":["不存在"]}`))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleUpdateVideoTags(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleUpdateVideoTagsSavesExistingTags(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "video-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		Title:       "清纯标题",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+		t.Fatalf("create tag: %v", err)
+	}
+
+	req := requestWithVideoID(http.MethodPut, "/api/video/video-1/tags", "video-1", strings.NewReader(`{"tags":["清纯"]}`))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleUpdateVideoTags(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetVideo(ctx, "video-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if !sameStrings(got.Tags, []string{"清纯"}) {
+		t.Fatalf("tags = %#v, want 清纯", got.Tags)
+	}
+}
+
+func TestHandleHideVideoRemovesVideoFromPublicListAndDetail(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID:          "video-hidden",
+			DriveID:     "drive",
+			FileID:      "file-hidden",
+			Title:       "Hide me",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		{
+			ID:          "video-visible",
+			DriveID:     "drive",
+			FileID:      "file-visible",
+			Title:       "Keep me",
+			PublishedAt: now.Add(-time.Minute),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	server := &Server{Catalog: cat}
+	hideReq := requestWithVideoID(http.MethodPost, "/api/video/video-hidden/hide", "video-hidden", strings.NewReader(``))
+	hideRR := httptest.NewRecorder()
+	server.handleHideVideo(hideRR, hideReq)
+
+	if hideRR.Code != http.StatusOK {
+		t.Fatalf("hide status = %d, body = %s", hideRR.Code, hideRR.Body.String())
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/list?page=1&size=24", nil)
+	listRR := httptest.NewRecorder()
+	server.handleList(listRR, listReq)
+
+	if listRR.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", listRR.Code, listRR.Body.String())
+	}
+	var listed struct {
+		Items []VideoDTO `json:"items"`
+		Total int        `json:"total"`
+	}
+	if err := json.NewDecoder(listRR.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if listed.Total != 1 || len(listed.Items) != 1 || listed.Items[0].ID != "video-visible" {
+		t.Fatalf("listed = total:%d items:%#v, want only video-visible", listed.Total, listed.Items)
+	}
+
+	detailReq := requestWithVideoID(http.MethodGet, "/api/video/video-hidden", "video-hidden", strings.NewReader(``))
+	detailRR := httptest.NewRecorder()
+	server.handleVideoDetail(detailRR, detailReq)
+
+	if detailRR.Code != http.StatusNotFound {
+		t.Fatalf("detail status = %d, want 404; body = %s", detailRR.Code, detailRR.Body.String())
 	}
 }
 
@@ -142,4 +305,21 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func containsString(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func requestWithVideoID(method, target, videoID string, body *strings.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", videoID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	return req
 }

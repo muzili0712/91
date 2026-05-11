@@ -3,6 +3,8 @@ package preview
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -73,6 +75,39 @@ func TestPreviewWorkerGeneratesTeaserWithoutReplacingExistingThumbnail(t *testin
 	}
 }
 
+func TestPreviewWorkerRemovesPreviousLocalTeaserAfterNewTeaserIsReady(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "preview-cleanup-video")
+	oldPath := filepath.Join(t.TempDir(), "old-teaser.mp4")
+	if err := os.WriteFile(oldPath, []byte("old teaser"), 0o644); err != nil {
+		t.Fatalf("write old teaser: %v", err)
+	}
+	video.PreviewLocal = oldPath
+	video.PreviewStatus = "ready"
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("update video: %v", err)
+	}
+
+	gen := &fakeTeaserGenerator{
+		localPath: filepath.Join(t.TempDir(), "new-teaser.mp4"),
+	}
+	drv := &previewFakeDrive{}
+	worker := NewWorker(gen, cat, drv, "")
+
+	worker.process(ctx, video)
+
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old teaser still exists or stat failed with unexpected error: %v", err)
+	}
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.PreviewLocal != gen.localPath {
+		t.Fatalf("preview local = %q, want %q", got.PreviewLocal, gen.localPath)
+	}
+}
+
 func seedPreviewTestVideo(t *testing.T, id string) (*catalog.Catalog, *catalog.Video) {
 	t.Helper()
 	ctx := context.Background()
@@ -117,7 +152,9 @@ func (g *fakeThumbGenerator) GenerateThumbnail(_ context.Context, _ *drives.Stre
 	return "/tmp/" + videoID + ".jpg", nil
 }
 
-type fakeTeaserGenerator struct{}
+type fakeTeaserGenerator struct {
+	localPath string
+}
 
 func (g *fakeTeaserGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
 	return 0, nil
@@ -128,6 +165,9 @@ func (g *fakeTeaserGenerator) Generate(context.Context, *drives.StreamLink, floa
 }
 
 func (g *fakeTeaserGenerator) MoveToLocal(_ string, videoID string) (string, error) {
+	if g.localPath != "" {
+		return g.localPath, nil
+	}
 	return "/tmp/" + videoID + ".mp4", nil
 }
 

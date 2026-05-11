@@ -1,0 +1,822 @@
+package catalog
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/video-site/backend/internal/fixedtags"
+)
+
+var ErrUnknownTag = errors.New("unknown tag")
+
+const avTagLabel = "AV"
+
+var (
+	avCodePattern              = regexp.MustCompile(`(?i)^[A-Z]{2,8}[-_ ]?\d{3,6}(?:[-_ ]?[A-Z0-9]{1,4})?$`)
+	ccAVCodePattern            = regexp.MustCompile(`(?i)^CC[-_ ]?\d{3,8}(?:[-_ ]?[A-Z0-9]{1,4})?$`)
+	fc2AVCodePattern           = regexp.MustCompile(`(?i)^FC2[-_ ]?(?:PPV[-_ ]?)?\d{4,8}(?:[-_ ]?[A-Z0-9]{1,4})?$`)
+	numericPrefixAVCodePattern = regexp.MustCompile(`(?i)^\d{2,4}[A-Z]{2,8}[-_ ]?\d{3,6}(?:[-_ ]?[A-Z0-9]{1,4})?$`)
+	avCodeInTextPattern        = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])((?:[A-Z]{2,8}[-_ ]?\d{3,6}(?:[-_ ]?[A-Z0-9]{1,4})?)|(?:CC[-_ ]?\d{3,8}(?:[-_ ]?[A-Z0-9]{1,4})?)|(?:FC2[-_ ]?(?:PPV[-_ ]?)?\d{4,8}(?:[-_ ]?[A-Z0-9]{1,4})?)|(?:\d{2,4}[A-Z]{2,8}[-_ ]?\d{3,6}(?:[-_ ]?[A-Z0-9]{1,4})?))(?:$|[^A-Za-z0-9])`)
+)
+
+type Tag struct {
+	ID      int64    `json:"id"`
+	Label   string   `json:"label"`
+	Aliases []string `json:"aliases,omitempty"`
+	Source  string   `json:"source"`
+	Count   int      `json:"count"`
+}
+
+func (c *Catalog) migrate(ctx context.Context) error {
+	if err := c.addColumnIfMissing(ctx, "videos", "tags_manual", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "content_hash", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "hidden", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_content_hash ON videos(content_hash)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_hidden ON videos(hidden)`); err != nil {
+		return err
+	}
+	if err := c.seedSystemTags(ctx); err != nil {
+		return err
+	}
+	if err := c.backfillVideoTags(ctx); err != nil {
+		return err
+	}
+	if err := c.collapseAVCodeTags(ctx); err != nil {
+		return err
+	}
+	if err := c.createCollectionTagsFromCategories(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Catalog) addColumnIfMissing(ctx context.Context, table, column, definition string) error {
+	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, column) {
+			return nil
+		}
+	}
+	_, err = c.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition)
+	return err
+}
+
+func (c *Catalog) seedSystemTags(ctx context.Context) error {
+	for _, label := range fixedtags.Labels {
+		if _, err := c.ensureTag(ctx, label, fixedtags.AliasesFor(label), "system"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) backfillVideoTags(ctx context.Context) error {
+	rows, err := c.db.QueryContext(ctx, `SELECT id, COALESCE(tags, '[]') FROM videos`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var videoID, tagsJSON string
+		if err := rows.Scan(&videoID, &tagsJSON); err != nil {
+			return err
+		}
+		var labels []string
+		if err := json.Unmarshal([]byte(tagsJSON), &labels); err != nil {
+			continue
+		}
+		if len(labels) == 0 {
+			continue
+		}
+		if err := c.addVideoTags(ctx, videoID, labels, "legacy", true); err != nil {
+			return err
+		}
+		if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) createCollectionTagsFromCategories(ctx context.Context) error {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT category, COUNT(*) FROM videos
+WHERE COALESCE(category, '') != ''
+GROUP BY category`)
+	if err != nil {
+		return err
+	}
+	type categoryStat struct {
+		category string
+		count    int
+	}
+	var categories []categoryStat
+	for rows.Next() {
+		var stat categoryStat
+		if err := rows.Scan(&stat.category, &stat.count); err != nil {
+			return err
+		}
+		categories = append(categories, stat)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, stat := range categories {
+		if isAVCodePollutedLabel(stat.category) {
+			if _, err := c.ensureTag(ctx, avTagLabel, fixedtags.AliasesFor(avTagLabel), "system"); err != nil {
+				return err
+			}
+			if err := c.addTagToVideosByCategory(ctx, stat.category, avTagLabel, "auto"); err != nil {
+				return err
+			}
+			continue
+		}
+		if stat.count < 3 {
+			continue
+		}
+		if !LooksLikeCollectionTag(stat.category) {
+			continue
+		}
+		if _, err := c.ensureTag(ctx, stat.category, nil, "collection"); err != nil {
+			return err
+		}
+		if err := c.addCollectionTagToVideos(ctx, stat.category); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) CreateTagAndClassify(ctx context.Context, label string, aliases []string, source string) (int, error) {
+	tag, err := c.ensureTag(ctx, label, aliases, source)
+	if err != nil {
+		return 0, err
+	}
+	return c.classifyTag(ctx, tag)
+}
+
+func (c *Catalog) ListTags(ctx context.Context) ([]Tag, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT t.id, t.label, t.aliases, t.source, COUNT(v.id) AS cnt
+FROM tags t
+LEFT JOIN video_tags vt ON vt.tag_id = t.id
+LEFT JOIN videos v ON v.id = vt.video_id AND COALESCE(v.hidden, 0) = 0
+GROUP BY t.id, t.label, t.aliases, t.source
+ORDER BY cnt DESC, t.label ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Tag
+	for rows.Next() {
+		tag, err := scanTag(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tag)
+	}
+	return out, nil
+}
+
+func (c *Catalog) SetManualVideoTags(ctx context.Context, videoID string, labels []string) error {
+	if _, err := c.GetVideo(ctx, videoID); err != nil {
+		return err
+	}
+	return c.replaceVideoTags(ctx, videoID, labels, "manual", true, false)
+}
+
+func (c *Catalog) SetAutoVideoTags(ctx context.Context, videoID string, labels []string) error {
+	if c.hasManualTags(ctx, videoID) {
+		return nil
+	}
+	return c.replaceVideoTags(ctx, videoID, labels, "auto", false, false)
+}
+
+func (c *Catalog) MatchTags(ctx context.Context, text string) ([]string, error) {
+	tags, err := c.ListTags(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matcher := normalizeTagText(text)
+	out := make([]string, 0, len(tags))
+	if ContainsAVCode(text) {
+		out = append(out, avTagLabel)
+	}
+	for _, tag := range tags {
+		candidates := append([]string{tag.Label}, tag.Aliases...)
+		for _, candidate := range candidates {
+			if matcher.contains(candidate) {
+				out = append(out, tag.Label)
+				break
+			}
+		}
+	}
+	return sortLabelsByTagOrder(tags, uniqueStrings(out)), nil
+}
+
+func (c *Catalog) EnsureCollectionTag(ctx context.Context, label string) (string, bool, error) {
+	label = cleanTagLabel(label)
+	if isAVCodePollutedLabel(label) {
+		if _, err := c.ensureTag(ctx, avTagLabel, fixedtags.AliasesFor(avTagLabel), "system"); err != nil {
+			return "", false, err
+		}
+		if err := c.addTagToVideosByCategory(ctx, label, avTagLabel, "auto"); err != nil {
+			return "", false, err
+		}
+		return avTagLabel, true, nil
+	}
+	if !LooksLikeCollectionTag(label) {
+		return "", false, nil
+	}
+	if !c.tagExists(ctx, label) {
+		count, err := c.categoryVideoCount(ctx, label)
+		if err != nil {
+			return "", false, err
+		}
+		if count < 2 {
+			return "", false, nil
+		}
+	}
+	if _, err := c.ensureTag(ctx, label, nil, "collection"); err != nil {
+		return "", false, err
+	}
+	if err := c.addCollectionTagToVideos(ctx, label); err != nil {
+		return "", false, err
+	}
+	return label, true, nil
+}
+
+func (c *Catalog) ensureTag(ctx context.Context, label string, aliases []string, source string) (Tag, error) {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return Tag{}, errors.New("tag label is required")
+	}
+	if isAVCodePollutedLabel(label) {
+		label = avTagLabel
+		aliases = fixedtags.AliasesFor(avTagLabel)
+		source = "system"
+	}
+	if source == "" {
+		source = "user"
+	}
+	aliases = cleanAliases(aliases, label)
+	aliasesJSON, _ := json.Marshal(aliases)
+	now := time.Now().UnixMilli()
+	if _, err := c.db.ExecContext(ctx, `
+INSERT OR IGNORE INTO tags (label, aliases, source, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)`, label, string(aliasesJSON), source, now, now); err != nil {
+		return Tag{}, err
+	}
+	if len(aliases) > 0 {
+		if _, err := c.db.ExecContext(ctx,
+			`UPDATE tags SET aliases = ?, updated_at = ? WHERE label = ? COLLATE NOCASE`,
+			string(aliasesJSON), now, label); err != nil {
+			return Tag{}, err
+		}
+	}
+	return c.getTagByLabel(ctx, label)
+}
+
+func (c *Catalog) getTagByLabel(ctx context.Context, label string) (Tag, error) {
+	row := c.db.QueryRowContext(ctx,
+		`SELECT id, label, aliases, source, 0 FROM tags WHERE label = ? COLLATE NOCASE`,
+		label)
+	return scanTag(row)
+}
+
+func (c *Catalog) classifyTag(ctx context.Context, tag Tag) (int, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT id, title, COALESCE(author, ''), COALESCE(category, ''), COALESCE(tags_manual, 0)
+FROM videos`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	classified := 0
+	for rows.Next() {
+		var videoID, title, author, category string
+		var manual int
+		if err := rows.Scan(&videoID, &title, &author, &category, &manual); err != nil {
+			return 0, err
+		}
+		if manual == 1 {
+			continue
+		}
+		matcher := normalizeTagText(title + " " + author + " " + category)
+		if !matcher.contains(tag.Label) {
+			matchedAlias := false
+			for _, alias := range tag.Aliases {
+				if matcher.contains(alias) {
+					matchedAlias = true
+					break
+				}
+			}
+			if !matchedAlias {
+				continue
+			}
+		}
+		added, err := c.addVideoTag(ctx, videoID, tag.Label, "auto", false)
+		if err != nil {
+			return 0, err
+		}
+		if added {
+			classified++
+		}
+		if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
+			return 0, err
+		}
+	}
+	return classified, nil
+}
+
+func (c *Catalog) replaceVideoTags(ctx context.Context, videoID string, labels []string, source string, manual bool, createMissing bool) error {
+	labels = uniqueStrings(cleanLabels(labels))
+	if createMissing {
+		for _, label := range labels {
+			if _, err := c.ensureTag(ctx, label, nil, "legacy"); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := c.validateTagsExist(ctx, labels); err != nil {
+			return err
+		}
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE video_id = ?`, videoID); err != nil {
+		return err
+	}
+	now := time.Now().UnixMilli()
+	for _, label := range labels {
+		tag, err := c.getTagByLabelTx(ctx, tx, label)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO video_tags (video_id, tag_id, source, created_at) VALUES (?, ?, ?, ?)`,
+			videoID, tag.ID, source, now); err != nil {
+			return err
+		}
+	}
+	manualValue := 0
+	if manual {
+		manualValue = 1
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE videos SET tags_manual = ? WHERE id = ?`, manualValue, videoID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return c.syncVideoTagsJSON(ctx, videoID, manual)
+}
+
+func (c *Catalog) addVideoTags(ctx context.Context, videoID string, labels []string, source string, createMissing bool) error {
+	for _, label := range uniqueStrings(cleanLabels(labels)) {
+		if _, err := c.addVideoTag(ctx, videoID, label, source, createMissing); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) addVideoTag(ctx context.Context, videoID, label, source string, createMissing bool) (bool, error) {
+	if createMissing {
+		if _, err := c.ensureTag(ctx, label, nil, "legacy"); err != nil {
+			return false, err
+		}
+	}
+	tag, err := c.getTagByLabel(ctx, label)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UnixMilli()
+	res, err := c.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO video_tags (video_id, tag_id, source, created_at) VALUES (?, ?, ?, ?)`,
+		videoID, tag.ID, source, now)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (c *Catalog) addCollectionTagToVideos(ctx context.Context, category string) error {
+	return c.addTagToVideosByCategory(ctx, category, category, "auto")
+}
+
+func (c *Catalog) addTagToVideosByCategory(ctx context.Context, category, label, source string) error {
+	rows, err := c.db.QueryContext(ctx, `SELECT id FROM videos WHERE category = ? AND COALESCE(tags_manual, 0) = 0`, category)
+	if err != nil {
+		return err
+	}
+	var videoIDs []string
+	for rows.Next() {
+		var videoID string
+		if err := rows.Scan(&videoID); err != nil {
+			return err
+		}
+		videoIDs = append(videoIDs, videoID)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, videoID := range videoIDs {
+		if _, err := c.addVideoTag(ctx, videoID, label, source, false); err != nil {
+			return err
+		}
+		if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) collapseAVCodeTags(ctx context.Context) error {
+	if _, err := c.ensureTag(ctx, avTagLabel, fixedtags.AliasesFor(avTagLabel), "system"); err != nil {
+		return err
+	}
+
+	rows, err := c.db.QueryContext(ctx, `SELECT id, label FROM tags`)
+	if err != nil {
+		return err
+	}
+
+	type pollutedTag struct {
+		id    int64
+		label string
+	}
+	var polluted []pollutedTag
+	for rows.Next() {
+		var tag pollutedTag
+		if err := rows.Scan(&tag.id, &tag.label); err != nil {
+			return err
+		}
+		if strings.EqualFold(tag.label, avTagLabel) || !isAVCodePollutedLabel(tag.label) {
+			continue
+		}
+		polluted = append(polluted, tag)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, tag := range polluted {
+		videoIDs, err := c.videoIDsForTagID(ctx, tag.id)
+		if err != nil {
+			return err
+		}
+		for _, videoID := range videoIDs {
+			if _, err := c.addVideoTag(ctx, videoID, avTagLabel, "auto", false); err != nil {
+				return err
+			}
+		}
+		if _, err := c.db.ExecContext(ctx, `DELETE FROM video_tags WHERE tag_id = ?`, tag.id); err != nil {
+			return err
+		}
+		if _, err := c.db.ExecContext(ctx, `DELETE FROM tags WHERE id = ?`, tag.id); err != nil {
+			return err
+		}
+		for _, videoID := range videoIDs {
+			if err := c.syncVideoTagsJSON(ctx, videoID, c.hasManualTags(ctx, videoID)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) videoIDsForTagID(ctx context.Context, tagID int64) ([]string, error) {
+	rows, err := c.db.QueryContext(ctx, `SELECT video_id FROM video_tags WHERE tag_id = ?`, tagID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var videoIDs []string
+	for rows.Next() {
+		var videoID string
+		if err := rows.Scan(&videoID); err != nil {
+			return nil, err
+		}
+		videoIDs = append(videoIDs, videoID)
+	}
+	return videoIDs, rows.Err()
+}
+
+func (c *Catalog) validateTagsExist(ctx context.Context, labels []string) error {
+	for _, label := range labels {
+		if _, err := c.getTagByLabel(ctx, label); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: %s", ErrUnknownTag, label)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) syncVideoTagsJSON(ctx context.Context, videoID string, manual bool) error {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT t.label
+FROM video_tags vt
+JOIN tags t ON t.id = vt.tag_id
+WHERE vt.video_id = ?
+ORDER BY t.id ASC`, videoID)
+	if err != nil {
+		return err
+	}
+	var labels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			return err
+		}
+		labels = append(labels, label)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	labelsJSON, _ := json.Marshal(labels)
+	manualValue := 0
+	if manual {
+		manualValue = 1
+	}
+	_, err = c.db.ExecContext(ctx,
+		`UPDATE videos SET tags = ?, tags_manual = ?, updated_at = ? WHERE id = ?`,
+		string(labelsJSON), manualValue, time.Now().UnixMilli(), videoID)
+	return err
+}
+
+func (c *Catalog) hasManualTags(ctx context.Context, videoID string) bool {
+	var manual int
+	err := c.db.QueryRowContext(ctx, `SELECT COALESCE(tags_manual, 0) FROM videos WHERE id = ?`, videoID).Scan(&manual)
+	return err == nil && manual == 1
+}
+
+func (c *Catalog) videoExists(ctx context.Context, videoID string) bool {
+	var exists int
+	err := c.db.QueryRowContext(ctx, `SELECT 1 FROM videos WHERE id = ?`, videoID).Scan(&exists)
+	return err == nil
+}
+
+func (c *Catalog) tagExists(ctx context.Context, label string) bool {
+	var exists int
+	err := c.db.QueryRowContext(ctx, `SELECT 1 FROM tags WHERE label = ? COLLATE NOCASE`, label).Scan(&exists)
+	return err == nil
+}
+
+func (c *Catalog) categoryVideoCount(ctx context.Context, category string) (int, error) {
+	var count int
+	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM videos WHERE category = ?`, category).Scan(&count)
+	return count, err
+}
+
+func (c *Catalog) getTagByLabelTx(ctx context.Context, tx *sql.Tx, label string) (Tag, error) {
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, label, aliases, source, 0 FROM tags WHERE label = ? COLLATE NOCASE`,
+		label)
+	return scanTag(row)
+}
+
+type tagRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTag(row tagRowScanner) (Tag, error) {
+	var tag Tag
+	var aliasesJSON string
+	if err := row.Scan(&tag.ID, &tag.Label, &aliasesJSON, &tag.Source, &tag.Count); err != nil {
+		return Tag{}, err
+	}
+	_ = json.Unmarshal([]byte(aliasesJSON), &tag.Aliases)
+	return tag, nil
+}
+
+type normalizedTagText struct {
+	lower   string
+	compact string
+	tokens  map[string]struct{}
+}
+
+func normalizeTagText(s string) normalizedTagText {
+	lower := strings.ToLower(s)
+	var compact strings.Builder
+	var spaced strings.Builder
+	for _, r := range lower {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			compact.WriteRune(r)
+			spaced.WriteRune(r)
+			continue
+		}
+		spaced.WriteByte(' ')
+	}
+	tokens := make(map[string]struct{})
+	for _, token := range strings.Fields(spaced.String()) {
+		tokens[token] = struct{}{}
+	}
+	return normalizedTagText{lower: lower, compact: compact.String(), tokens: tokens}
+}
+
+func (n normalizedTagText) contains(alias string) bool {
+	lowerAlias := strings.ToLower(strings.TrimSpace(alias))
+	compactAlias := compactTagText(lowerAlias)
+	if compactAlias == "" {
+		return false
+	}
+	if isShortASCIIWord(compactAlias) && compactAlias == lowerAlias {
+		_, ok := n.tokens[compactAlias]
+		return ok
+	}
+	if strings.Contains(n.lower, lowerAlias) {
+		return true
+	}
+	return strings.Contains(n.compact, compactAlias)
+}
+
+func compactTagText(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isShortASCIIWord(s string) bool {
+	if len(s) > 3 {
+		return false
+	}
+	for _, r := range s {
+		if r > unicode.MaxASCII || (!unicode.IsLetter(r) && !unicode.IsDigit(r)) {
+			return false
+		}
+	}
+	return true
+}
+
+func LooksLikeCollectionTag(label string) bool {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return false
+	}
+	if isAVCodePollutedLabel(label) {
+		return false
+	}
+	runes := []rune(label)
+	if len(runes) < 2 || len(runes) > 24 {
+		return false
+	}
+	lower := strings.ToLower(label)
+	blocked := map[string]bool{
+		"v": true, "pv": true, "my pack": true, "my upload": true,
+		"视频": true, "视频1": true, "第一直播": true, "男人必备": true,
+		"瑟女聚集地": true, "成人色游": true, "ai女友": true,
+	}
+	if blocked[lower] {
+		return false
+	}
+	hasLetter := false
+	for _, r := range label {
+		if unicode.IsLetter(r) {
+			hasLetter = true
+			break
+		}
+	}
+	if !hasLetter {
+		return false
+	}
+	for _, r := range label {
+		switch r {
+		case '，', '。', '！', '？', '；', '、', '：', '~', '～':
+			return false
+		}
+	}
+	return true
+}
+
+func IsAVCode(label string) bool {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return false
+	}
+	return avCodePattern.MatchString(label) || ccAVCodePattern.MatchString(label) || fc2AVCodePattern.MatchString(label) || numericPrefixAVCodePattern.MatchString(label)
+}
+
+func ContainsAVCode(text string) bool {
+	return avCodeInTextPattern.MatchString(text)
+}
+
+func isAVCodePollutedLabel(label string) bool {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return false
+	}
+	return IsAVCode(label) || ContainsAVCode(label)
+}
+
+func cleanLabels(labels []string) []string {
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		label = cleanTagLabel(label)
+		if label != "" {
+			if isAVCodePollutedLabel(label) {
+				label = avTagLabel
+			}
+			out = append(out, label)
+		}
+	}
+	return out
+}
+
+func cleanTagLabel(label string) string {
+	return strings.TrimSpace(label)
+}
+
+func cleanAliases(aliases []string, label string) []string {
+	out := make([]string, 0, len(aliases))
+	seen := map[string]bool{strings.ToLower(label): true}
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		key := strings.ToLower(alias)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, alias)
+	}
+	return out
+}
+
+func uniqueStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		key := strings.ToLower(value)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func sortLabelsByTagOrder(tags []Tag, labels []string) []string {
+	order := make(map[string]int, len(tags))
+	for i, tag := range tags {
+		order[strings.ToLower(tag.Label)] = i
+	}
+	sort.SliceStable(labels, func(i, j int) bool {
+		return order[strings.ToLower(labels[i])] < order[strings.ToLower(labels[j])]
+	})
+	return labels
+}

@@ -1,33 +1,38 @@
-import { useRef, useState } from "react";
-import { Copy } from "lucide-react";
-import type { VideoDetail } from "@/types";
-import { formatCount } from "@/lib/format";
+import { useState } from "react";
+import type { TagItem, VideoDetail } from "@/types";
 
 type Props = {
   video: VideoDetail;
+  availableTags?: TagItem[];
+  tagSaving?: boolean;
+  onTagsChange?: (tags: string[]) => Promise<void>;
 };
 
-export function VideoInfoPanel({ video }: Props) {
+export function VideoInfoPanel({
+  video,
+  availableTags = [],
+  tagSaving = false,
+  onTagsChange,
+}: Props) {
   const [collapsed, setCollapsed] = useState(true);
-  const [copied, setCopied] = useState(false);
-  const [following, setFollowing] = useState(
-    video.authorProfile.isFollowing ?? false
-  );
-  const embedRef = useRef<HTMLTextAreaElement | null>(null);
+  const [editingTags, setEditingTags] = useState(false);
+  const [draftTags, setDraftTags] = useState<string[]>(video.tags ?? []);
+  const [tagError, setTagError] = useState("");
 
-  async function copyEmbed() {
-    const value = video.embedUrl;
+  function openTagEditor() {
+    setDraftTags(video.tags ?? []);
+    setTagError("");
+    setEditingTags(true);
+  }
+
+  async function saveTags() {
+    if (!onTagsChange) return;
+    setTagError("");
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(value);
-      } else if (embedRef.current) {
-        embedRef.current.select();
-        document.execCommand("copy");
-      }
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      // noop
+      await onTagsChange(draftTags);
+      setEditingTags(false);
+    } catch (e) {
+      setTagError(e instanceof Error ? e.message : "保存标签失败");
     }
   }
 
@@ -41,48 +46,52 @@ export function VideoInfoPanel({ video }: Props) {
         </div>
 
         <div className="info-row">
-          <span className="info-row__label">作者</span>
+          <span className="info-row__label">来源/合集</span>
           <div className="info-row__value">
-            <div className="author-card">
-              <div className="author-card__avatar">
-                {video.authorProfile.name.slice(0, 1)}
-              </div>
-              <div>
-                <div className="author-card__name">
-                  {video.authorProfile.name}
-                </div>
-                <div className="author-card__meta">
-                  {video.authorProfile.signupAge} ·{" "}
-                  {formatCount(video.authorProfile.followers)} 粉丝 ·{" "}
-                  {formatCount(video.authorProfile.videoCount)} 视频
-                </div>
-              </div>
-              <button
-                className={`author-card__follow ${
-                  following ? "is-following" : ""
-                }`}
-                onClick={() => setFollowing((v) => !v)}
-                aria-pressed={following}
-              >
-                {following ? "已关注" : "关注"}
-              </button>
-            </div>
+            {video.category || video.author || "未设置"}
           </div>
         </div>
 
         <div className="info-row">
           <span className="info-row__label">标签</span>
-          <span className="info-row__value">
-            {(video.tags ?? []).map((t) => (
-              <span
-                key={t}
-                className="tag-chip"
-                style={{ marginRight: 6, marginBottom: 4, display: "inline-block" }}
-              >
-                {t}
-              </span>
-            ))}
-          </span>
+          <div className="info-row__value">
+            <div className="detail-tags">
+              {(video.tags ?? []).map((t) => (
+                <span key={t} className="tag-chip">
+                  {t}
+                </span>
+              ))}
+              {onTagsChange && (
+                <button className="detail-tags__edit" onClick={openTagEditor}>
+                  选择标签
+                </button>
+              )}
+            </div>
+            {editingTags && (
+              <div className="detail-tag-editor">
+                <div className="detail-tag-editor__grid">
+                  {availableTags.map((tag) => (
+                    <label key={tag.id} className="detail-tag-editor__item">
+                      <input
+                        type="checkbox"
+                        checked={draftTags.includes(tag.label)}
+                        onChange={() => setDraftTags(toggleTag(draftTags, tag.label))}
+                      />
+                      <span>{tag.label}</span>
+                      {typeof tag.count === "number" && <em>{tag.count}</em>}
+                    </label>
+                  ))}
+                </div>
+                {tagError && <div className="detail-tag-editor__error">{tagError}</div>}
+                <div className="detail-tag-editor__actions">
+                  <button onClick={() => setEditingTags(false)}>取消</button>
+                  <button onClick={saveTags} disabled={tagSaving}>
+                    {tagSaving ? "保存中..." : "保存"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="info-row">
@@ -102,29 +111,13 @@ export function VideoInfoPanel({ video }: Props) {
           </span>
         </div>
 
-        <div className="info-row">
-          <span className="info-row__label">嵌入代码</span>
-          <span className="info-row__value">
-            <div className="embed-box">
-              <textarea
-                ref={embedRef}
-                className="embed-box__input"
-                readOnly
-                value={video.embedUrl}
-                onClick={(e) => (e.target as HTMLTextAreaElement).select()}
-                aria-label="嵌入代码"
-              />
-              <button
-                className={`embed-box__copy ${copied ? "is-copied" : ""}`}
-                onClick={copyEmbed}
-              >
-                <Copy size={14} />
-                {copied ? "已复制" : "复制"}
-              </button>
-            </div>
-          </span>
-        </div>
       </div>
     </section>
   );
+}
+
+function toggleTag(tags: string[], label: string): string[] {
+  return tags.includes(label)
+    ? tags.filter((tag) => tag !== label)
+    : [...tags, label];
 }

@@ -20,9 +20,9 @@ import (
 type Config struct {
 	FFmpegPath      string
 	FFprobePath     string
-	DurationSeconds int // 单段时长（秒），用于单段 fallback；拼接模式下每段 = DurationSeconds / 段数
+	DurationSeconds int // 兼容旧配置；当前 teaser 每段固定 3 秒
 	Width           int
-	Segments        int    // teaser 段数，1=单段，推荐 3
+	Segments        int    // 兼容旧配置；当前 30 秒及以上视频固定使用 4 段
 	LocalDir        string // 本地兜底
 	RemoteDir       string // 远端目录路径（相对盘根）
 }
@@ -49,8 +49,8 @@ func New(cfg Config) *Generator {
 	if cfg.FFprobePath == "" {
 		cfg.FFprobePath = "ffprobe"
 	}
-	if cfg.DurationSeconds == 0 {
-		cfg.DurationSeconds = 9 // 3 段 × 3 秒
+	if cfg.DurationSeconds != 3 {
+		cfg.DurationSeconds = 3
 	}
 	if cfg.Width == 0 {
 		cfg.Width = 480
@@ -63,12 +63,40 @@ func New(cfg Config) *Generator {
 
 // --- 选段策略 ---
 
+type teaserPlan struct {
+	starts  []float64
+	eachSec float64
+}
+
+func buildTeaserPlan(cfg Config, duration float64) teaserPlan {
+	if cfg.DurationSeconds != 3 {
+		cfg.DurationSeconds = 3
+	}
+	if cfg.Segments <= 0 {
+		cfg.Segments = 3
+	}
+
+	segs := 1
+	if duration > 0 && duration < 30 {
+		segs = 3
+	} else if duration >= 30 {
+		segs = 4
+	}
+
+	eachSec := 3.0
+
+	return teaserPlan{
+		starts:  pickSegmentStarts(duration, segs, eachSec),
+		eachSec: eachSec,
+	}
+}
+
 // pickSegmentStarts 根据视频总时长选出 N 段起点秒数（按时间升序）
 //
 // 规则：
-//   - duration < 30s → 单段从 max(2, duration*0.1) 起
-//   - 30s ≤ duration < 10min → N 段：前段跳过片头、末段避开片尾
-//   - duration ≥ 10min → 20% / 50% / 80%（或按 N 等距分布）
+//   - duration < 30s → 最多 3 段；放不下完整 3 秒片段时丢弃对应片段
+//   - 30s ≤ duration < 10min → 4 段：前段跳过片头、末段避开片尾
+//   - duration ≥ 10min → 固定 4 段，按 20% ~ 80% 等距分布
 func pickSegmentStarts(duration float64, n int, eachSec float64) []float64 {
 	if n <= 0 {
 		n = 1
@@ -77,18 +105,31 @@ func pickSegmentStarts(duration float64, n int, eachSec float64) []float64 {
 		// 未知时长，用保守默认
 		return []float64{10}
 	}
+	if duration < 30 {
+		completeSegments := int(math.Floor(duration / eachSec))
+		if completeSegments > n {
+			completeSegments = n
+		}
+		if completeSegments <= 0 {
+			return nil
+		}
+		usable := duration - eachSec
+		first := math.Min(duration*0.1, usable)
+		if completeSegments == 1 {
+			return []float64{math.Max(0, first)}
+		}
+		starts := make([]float64, 0, completeSegments)
+		step := (usable - first) / float64(completeSegments-1)
+		for i := 0; i < completeSegments; i++ {
+			starts = append(starts, first+step*float64(i))
+		}
+		return starts
+	}
+
 	// 余量：保证最后一段结束前留 1 秒，避免切到文件末尾
 	usable := duration - eachSec - 1
 	if usable < 0 {
 		usable = 0
-	}
-
-	if duration < 30 {
-		start := math.Max(2, duration*0.1)
-		if start > usable {
-			start = math.Max(0, usable)
-		}
-		return []float64{start}
 	}
 
 	if duration < 600 {
@@ -235,21 +276,12 @@ func (g *Generator) Generate(ctx context.Context, link *drives.StreamLink, durat
 		return "", err
 	}
 
-	segs := g.cfg.Segments
-	// 视频太短直接单段
-	if duration > 0 && duration < 30 {
-		segs = 1
+	plan := buildTeaserPlan(g.cfg, duration)
+	starts := plan.starts
+	eachSec := plan.eachSec
+	if len(starts) == 0 {
+		return "", fmt.Errorf("video too short for %.0fs teaser segment", eachSec)
 	}
-
-	eachSec := float64(g.cfg.DurationSeconds)
-	if segs > 1 {
-		eachSec = float64(g.cfg.DurationSeconds) / float64(segs)
-		if eachSec < 2 {
-			eachSec = 2
-		}
-	}
-
-	starts := pickSegmentStarts(duration, segs, eachSec)
 
 	ctx2, cancel := context.WithTimeout(ctx, 4*time.Minute)
 	defer cancel()
@@ -390,10 +422,27 @@ func NewWorker(gen TeaserGenerator, cat *catalog.Catalog, drv drives.Drive, remo
 	}
 }
 
-func (w *Worker) Enqueue(v *catalog.Video) {
+func (w *Worker) Enqueue(v *catalog.Video) bool {
+	if v == nil {
+		return false
+	}
 	select {
 	case w.ch <- v:
+		return true
 	default:
+		return false
+	}
+}
+
+func (w *Worker) EnqueueBlocking(ctx context.Context, v *catalog.Video) bool {
+	if v == nil {
+		return false
+	}
+	select {
+	case w.ch <- v:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -413,10 +462,27 @@ func NewThumbWorker(gen ThumbnailGenerator, cat *catalog.Catalog, drv drives.Dri
 	}
 }
 
-func (w *ThumbWorker) Enqueue(v *catalog.Video) {
+func (w *ThumbWorker) Enqueue(v *catalog.Video) bool {
+	if v == nil {
+		return false
+	}
 	select {
 	case w.ch <- v:
+		return true
 	default:
+		return false
+	}
+}
+
+func (w *ThumbWorker) EnqueueBlocking(ctx context.Context, v *catalog.Video) bool {
+	if v == nil {
+		return false
+	}
+	select {
+	case w.ch <- v:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -522,8 +588,21 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 			log.Printf("[preview] upload %s: %v (local only)", v.Title, uerr)
 		}
 	}
+	removePreviousLocalTeaser(v.PreviewLocal, local)
 	w.Catalog.UpdatePreview(ctx, v.ID, previewFileID, local, "ready")
 	log.Printf("[preview] ready %s (duration=%.1fs)", v.Title, duration)
+}
+
+func removePreviousLocalTeaser(previous, current string) {
+	if previous == "" {
+		return
+	}
+	if filepath.Clean(previous) == filepath.Clean(current) {
+		return
+	}
+	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
+		log.Printf("[preview] remove old local teaser %s: %v", previous, err)
+	}
 }
 
 func (w *Worker) uploadToDrive(ctx context.Context, videoID, localPath string) (string, error) {

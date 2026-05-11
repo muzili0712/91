@@ -54,13 +54,16 @@ export function me() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive";
   name: string;
   rootId: string;
   scanRootId: string;
   status: string;
   lastError?: string;
   hasCredential: boolean;
+  teaserReadyCount: number;
+  teaserPendingCount: number;
+  teaserFailedCount: number;
 };
 
 export function listDrives() {
@@ -69,7 +72,7 @@ export function listDrives() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive";
   name: string;
   rootId: string;
   scanRootId: string;
@@ -122,8 +125,20 @@ export type AdminVideo = {
   updatedAt: string;
 };
 
-export function listVideos() {
-  return request<{ items: AdminVideo[]; total: number }>("/videos");
+export type AdminVideoList = {
+  items: AdminVideo[];
+  total: number;
+  page: number;
+  size: number;
+};
+
+export function listVideos(params: { driveId?: string; page?: number; size?: number } = {}) {
+  const qs = new URLSearchParams();
+  if (params.driveId) qs.set("driveId", params.driveId);
+  if (params.page) qs.set("page", String(params.page));
+  if (params.size) qs.set("size", String(params.size));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<AdminVideoList>(`/videos${suffix}`);
 }
 
 export type UpdateVideoInput = Partial<{
@@ -150,6 +165,27 @@ export function regenPreview(id: string) {
     `/videos/${encodeURIComponent(id)}/regen-preview`,
     { method: "POST" }
   );
+}
+
+// ---------- Tags ----------
+
+export type AdminTag = {
+  id: number;
+  label: string;
+  aliases?: string[];
+  source: string;
+  count: number;
+};
+
+export function listTags() {
+  return request<AdminTag[]>("/tags");
+}
+
+export function createTag(label: string, aliases: string[]) {
+  return request<{ label: string; classified: number }>("/tags", {
+    method: "POST",
+    body: JSON.stringify({ label, aliases }),
+  });
 }
 
 // ---------- Settings ----------

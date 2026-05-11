@@ -3,6 +3,7 @@ package pikpak
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/video-site/backend/internal/drives"
@@ -78,6 +79,7 @@ func fileToEntry(f file, parentID string) drives.Entry {
 		ID:           f.ID,
 		Name:         f.Name,
 		Size:         size,
+		Hash:         strings.TrimSpace(f.Hash),
 		IsDir:        f.Kind == "drive#folder",
 		ParentID:     parentID,
 		MimeType:     guessMime(f.Name),

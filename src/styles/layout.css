@@ -2,6 +2,9 @@
   display: flex;
   flex-direction: column;
   min-height: 100vh;
+  background: var(--color-page);
+  color: var(--color-muted-light);
+  font-size: 13px;
 }
 
 .app-shell__main {
@@ -12,11 +15,11 @@
 .container {
   max-width: var(--container-max);
   margin: 0 auto;
-  padding: 0 var(--space-4);
+  padding: 0 15px;
 }
 
 .page-section {
-  padding: var(--space-5) 0;
+  padding: var(--space-4) 0;
 }
 
 .page-section + .page-section {
@@ -27,12 +30,13 @@
   display: flex;
   align-items: center;
   height: 40px;
-  padding: 0 var(--space-4);
+  padding: 0 14px;
   background: var(--color-accent);
   color: var(--color-text-invert);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-accent-dark);
+  border-radius: 2px 2px 0 0;
 }
 
 .section-header__title {
@@ -40,26 +44,22 @@
 }
 
 .section-header__extra {
-  font-size: 13px;
+  font-size: 12px;
   opacity: 0.9;
 }
 
 .promo-strip {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: var(--space-3);
-  margin-top: var(--space-4);
+  gap: 10px;
+  margin-top: var(--space-3);
 }
 
 .promo-card {
-  height: 96px;
-  padding: var(--space-3);
-  border-radius: var(--radius-md);
-  background: linear-gradient(
-    135deg,
-    var(--color-nav) 0%,
-    #3a3a3a 100%
-  );
+  height: 82px;
+  padding: 10px;
+  border-radius: 2px;
+  background: #111111;
   color: var(--color-text-invert);
   display: flex;
   flex-direction: column;
@@ -71,11 +71,11 @@
   font-size: 11px;
   text-transform: uppercase;
   color: var(--color-accent);
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
 }
 
 .promo-card__title {
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
 }
 
@@ -113,10 +113,11 @@
 }
 
 .footer {
-  margin-top: var(--space-8);
-  padding: var(--space-6) 0;
+  margin-top: var(--space-6);
+  padding: var(--space-5) 0;
   background: var(--color-nav);
   color: var(--color-muted-light);
+  border-top: 1px solid #252525;
 }
 
 .footer__inner {
@@ -145,6 +146,14 @@
 }
 
 @media (max-width: 640px) {
+  .container {
+    padding: 0 15px;
+  }
+
+  .page-section {
+    padding: var(--space-3) 0;
+  }
+
   .promo-strip {
     grid-template-columns: 1fr;
   }

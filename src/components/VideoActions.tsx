@@ -3,6 +3,7 @@ import {
   Bookmark,
   Download,
   Flag,
+  EyeOff,
   MessageSquare,
   ThumbsDown,
   ThumbsUp,
@@ -13,9 +14,16 @@ import { formatCount } from "@/lib/format";
 type Props = {
   video: VideoDetail;
   onJumpToComments: () => void;
+  onHideVideo: () => void;
+  hideSaving?: boolean;
 };
 
-export function VideoActions({ video, onJumpToComments }: Props) {
+export function VideoActions({
+  video,
+  onJumpToComments,
+  onHideVideo,
+  hideSaving,
+}: Props) {
   const [likes, setLikes] = useState(video.likes ?? 0);
   const [dislikes, setDislikes] = useState(video.dislikes ?? 0);
   const [bursting, setBursting] = useState(false);
@@ -111,6 +119,14 @@ export function VideoActions({ video, onJumpToComments }: Props) {
         <button className="video-actions__btn" title="举报">
           <Flag size={14} />
           举报
+        </button>
+        <button
+          className="video-actions__btn is-danger"
+          onClick={onHideVideo}
+          disabled={hideSaving}
+        >
+          <EyeOff size={14} />
+          {hideSaving ? "隐藏中" : "不再展示"}
         </button>
       </div>
     </>

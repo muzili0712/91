@@ -9,11 +9,11 @@ import (
 )
 
 type Config struct {
-	Server  Server   `yaml:"server"`
-	Storage Storage  `yaml:"storage"`
-	Scanner Scanner  `yaml:"scanner"`
-	Preview Preview  `yaml:"preview"`
-	Drives  []Drive  `yaml:"drives"`
+	Server  Server  `yaml:"server"`
+	Storage Storage `yaml:"storage"`
+	Scanner Scanner `yaml:"scanner"`
+	Preview Preview `yaml:"preview"`
+	Drives  []Drive `yaml:"drives"`
 }
 
 type Server struct {
@@ -51,11 +51,11 @@ type Preview struct {
 // Drive 配置项中的敏感字段（Cookie / RefreshToken 等）最终由管理后台写入 DB
 // 这里保留 yaml 中的静态定义，用于启动时预置盘。生产建议只在 DB 里维护。
 type Drive struct {
-	ID       string                 `yaml:"id"`
-	Kind     string                 `yaml:"kind"` // quark / p115 / pikpak / wopan
-	Name     string                 `yaml:"name"`
-	RootID   string                 `yaml:"root_id"`
-	Params   map[string]string      `yaml:"params,omitempty"`
+	ID     string            `yaml:"id"`
+	Kind   string            `yaml:"kind"` // quark / p115 / pikpak / wopan / onedrive
+	Name   string            `yaml:"name"`
+	RootID string            `yaml:"root_id"`
+	Params map[string]string `yaml:"params,omitempty"`
 }
 
 // Load 读取配置；若不存在则从 config.example.yaml 复制一份并返回
@@ -105,8 +105,8 @@ func (c *Config) applyDefaults() {
 	if c.Preview.FFprobePath == "" {
 		c.Preview.FFprobePath = "ffprobe"
 	}
-	if c.Preview.DurationSeconds == 0 {
-		c.Preview.DurationSeconds = 9
+	if c.Preview.DurationSeconds != 3 {
+		c.Preview.DurationSeconds = 3
 	}
 	if c.Preview.Width == 0 {
 		c.Preview.Width = 480

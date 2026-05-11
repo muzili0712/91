@@ -29,6 +29,23 @@ export function fetchVideoDetail(id: string): Promise<VideoDetail | null> {
   );
 }
 
+export function updateVideoTags(
+  id: string,
+  tags: string[]
+): Promise<VideoItem> {
+  return apiJSON<VideoItem>(`/api/video/${encodeURIComponent(id)}/tags`, {
+    method: "PUT",
+    body: JSON.stringify({ tags }),
+  });
+}
+
+export function hideVideo(id: string): Promise<{ ok: boolean }> {
+  return apiJSON<{ ok: boolean }>(
+    `/api/video/${encodeURIComponent(id)}/hide`,
+    { method: "POST" }
+  );
+}
+
 export type TagItem = { id: string; label: string; count?: number };
 
 export function fetchTags(): Promise<TagItem[]> {
@@ -37,6 +54,16 @@ export function fetchTags(): Promise<TagItem[]> {
 
 async function apiGet<T>(path: string): Promise<T> {
   const res = await fetch(path, { credentials: "include" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function apiJSON<T>(path: string, init: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }

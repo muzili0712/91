@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
-import { HardDrive, Film, LogOut, Play, Home } from "lucide-react";
+import { HardDrive, Film, LogOut, Play, Home, Tags } from "lucide-react";
 import { useAuth } from "./AuthContext";
 import { useToast } from "./ToastContext";
 import { PreviewToggle } from "./PreviewToggle";
@@ -47,6 +47,14 @@ export function AdminLayout() {
             }
           >
             <Film size={16} /> 视频管理
+          </NavLink>
+          <NavLink
+            to="/admin/tags"
+            className={({ isActive }) =>
+              `admin-nav__link ${isActive ? "is-active" : ""}`
+            }
+          >
+            <Tags size={16} /> 标签管理
           </NavLink>
         </nav>
         <div className="admin-sidebar__footer">

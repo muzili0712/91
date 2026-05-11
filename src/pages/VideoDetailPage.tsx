@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import { AppShell } from "@/components/AppShell";
 import { SearchPanel } from "@/components/SearchPanel";
 import { VideoPlayer } from "@/components/VideoPlayer";
@@ -7,22 +7,34 @@ import { VideoActions } from "@/components/VideoActions";
 import { VideoInfoPanel } from "@/components/VideoInfoPanel";
 import { CommentPanel } from "@/components/CommentPanel";
 import { RecommendedRail } from "@/components/RecommendedRail";
-import { fetchVideoDetail } from "@/data/videos";
-import type { VideoDetail } from "@/types";
+import {
+  fetchTags,
+  fetchVideoDetail,
+  hideVideo,
+  updateVideoTags,
+} from "@/data/videos";
+import type { TagItem, VideoDetail } from "@/types";
 
 export default function VideoDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [detail, setDetail] = useState<VideoDetail | null>(null);
+  const [tags, setTags] = useState<TagItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [tagSaving, setTagSaving] = useState(false);
+  const [hideSaving, setHideSaving] = useState(false);
+  const detailTopRef = useRef<HTMLDivElement | null>(null);
   const commentRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!id) return;
     let active = true;
+    window.scrollTo({ top: 0, behavior: "auto" });
     setLoading(true);
-    fetchVideoDetail(id).then((d) => {
+    Promise.all([fetchVideoDetail(id), fetchTags()]).then(([d, tagList]) => {
       if (!active) return;
       setDetail(d);
+      setTags(tagList);
       setLoading(false);
       document.title = d ? `${d.title} · 视频聚合站` : "视频不存在";
     });
@@ -31,8 +43,42 @@ export default function VideoDetailPage() {
     };
   }, [id]);
 
+  useLayoutEffect(() => {
+    if (loading || !detail) return;
+    window.requestAnimationFrame(() => {
+      detailTopRef.current?.scrollIntoView({
+        block: "start",
+        behavior: "auto",
+      });
+    });
+  }, [loading, detail?.id]);
+
   function jumpToComments() {
     commentRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function handleTagsChange(nextTags: string[]) {
+    if (!detail) return;
+    setTagSaving(true);
+    try {
+      const updated = await updateVideoTags(detail.id, nextTags);
+      setDetail({ ...detail, tags: updated.tags ?? [] });
+    } finally {
+      setTagSaving(false);
+    }
+  }
+
+  async function handleHideVideo() {
+    if (!detail || hideSaving) return;
+    if (!window.confirm("确定以后不再展示这个视频吗？")) return;
+    setHideSaving(true);
+    try {
+      await hideVideo(detail.id);
+      navigate("/list", { replace: true });
+    } catch {
+      setHideSaving(false);
+      window.alert("隐藏失败，请稍后重试");
+    }
   }
 
   if (loading) {
@@ -68,7 +114,7 @@ export default function VideoDetailPage() {
 
       <div className="container">
         <div className="detail-layout">
-          <div className="detail-main">
+          <div className="detail-main" ref={detailTopRef}>
             <div className="detail-title-bar">{detail.title}</div>
             <VideoPlayer
               src={detail.videoSrc}
@@ -78,8 +124,15 @@ export default function VideoDetailPage() {
             <VideoActions
               video={detail}
               onJumpToComments={jumpToComments}
+              onHideVideo={handleHideVideo}
+              hideSaving={hideSaving}
             />
-            <VideoInfoPanel video={detail} />
+            <VideoInfoPanel
+              video={detail}
+              availableTags={tags}
+              tagSaving={tagSaving}
+              onTagsChange={handleTagsChange}
+            />
             <CommentPanel
               ref={commentRef}
               comments={detail.commentsList}

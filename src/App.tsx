@@ -7,6 +7,7 @@ import { LoginPage } from "@/admin/LoginPage";
 import { RequireAuth } from "@/admin/RequireAuth";
 import { DrivesPage } from "@/admin/DrivesPage";
 import { VideosPage } from "@/admin/VideosPage";
+import { TagsPage } from "@/admin/TagsPage";
 
 export default function App() {
   return (
@@ -51,6 +52,7 @@ export default function App() {
         <Route index element={<Navigate to="/admin/drives" replace />} />
         <Route path="drives" element={<DrivesPage />} />
         <Route path="videos" element={<VideosPage />} />
+        <Route path="tags" element={<TagsPage />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

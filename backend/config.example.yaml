@@ -1,6 +1,7 @@
 # backend 配置示例。首次启动若未发现 config.yaml，会基于此文件自动创建。
 server:
-  listen: ":8080"
+  # 本地开发默认配合 vite.config.ts 的代理端口。
+  listen: "127.0.0.1:9192"
   # 管理后台用户，生产环境请务必修改
   admin:
     username: "admin"
@@ -28,9 +29,9 @@ preview:
   # ffmpeg / ffprobe 可执行文件名或绝对路径
   ffmpeg_path: "ffmpeg"
   ffprobe_path: "ffprobe"
-  # teaser 总时长（秒）。多段模式下会均分给每段
-  duration_seconds: 9
-  # teaser 段数。1=从视频 25% 位置取单段；>=2 按时长自适应切段并拼接
+  # teaser 每段时长（秒），实际生成时每段最多 3 秒
+  duration_seconds: 3
+  # 兼容旧配置；当前 30 秒以下最多 3 段，30 秒及以上固定 4 段
   segments: 3
   # teaser 视频宽度
   width: 480
@@ -38,5 +39,14 @@ preview:
   remote_dir: "/previews"
 
 # 盘列表。上线后请通过管理后台添加，本文件可留空。
-# kind 支持 quark / p115 / pikpak / wopan。
+# kind 支持 quark / p115 / pikpak / wopan / onedrive。
+# OneDrive 示例：
+# - id: "my-onedrive"
+#   kind: "onedrive"
+#   name: "我的 OneDrive"
+#   root_id: "root"
+#   params:
+#     refresh_token: "..."
+#     api_url_address: "https://api.oplist.org/onedrive/renewapi"
+#     region: "global"
 drives: []

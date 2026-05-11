@@ -9,6 +9,7 @@ const kindLabel: Record<string, string> = {
   p115: "115 网盘",
   pikpak: "PikPak",
   wopan: "联通沃盘",
+  onedrive: "OneDrive",
 };
 
 type Kind = api.AdminDrive["kind"];
@@ -135,7 +136,7 @@ export function DrivesPage() {
         <div className="admin-empty">加载中...</div>
       ) : list.length === 0 ? (
         <div className="admin-card admin-empty">
-          还没有配置任何网盘。点击右上角「新建」，选择夸克 / 115 / PikPak / 沃盘，填入凭证即可。
+          还没有配置任何网盘。点击右上角「新建」，选择夸克 / 115 / PikPak / 沃盘 / OneDrive，填入凭证即可。
         </div>
       ) : (
         <table className="admin-table">
@@ -283,6 +284,7 @@ function DriveForm({
           <option value="p115">115 网盘</option>
           <option value="pikpak">PikPak</option>
           <option value="wopan">联通沃盘</option>
+          <option value="onedrive">OneDrive</option>
         </select>
       </div>
       <div className="admin-form__row">
@@ -290,7 +292,7 @@ function DriveForm({
         <input
           value={form.rootId}
           onChange={(e) => set("rootId", e.target.value)}
-          placeholder={form.kind === "pikpak" ? "留空表示根目录" : "0"}
+          placeholder={form.kind === "pikpak" ? "留空表示根目录" : form.kind === "onedrive" ? "root" : "0"}
         />
       </div>
       <div className="admin-form__row">
@@ -345,6 +347,8 @@ function credentialHelp(kind: Kind, isEdit: boolean): string {
       return `参考 OpenList 的 PikPak 登录方式。可填用户名和密码首次登录，也可填 refresh_token；如返回验证码链接，打开验证后把 captcha_token 粘贴回来。${note}`;
     case "wopan":
       return `需要 access_token 和 refresh_token。后续会加扫码/短信登录入口，第一版只能手工粘贴。${note}`;
+    case "onedrive":
+      return `按 OpenList 默认方式，通过 api.oplist.org 在线刷新 token。只需要 refresh_token；保存后会自动回写新的 access_token / refresh_token。${note}`;
     default:
       return "";
   }
@@ -441,9 +445,50 @@ function credentialFields(kind: Kind): Array<{
           placeholder: "留空走个人空间",
         },
       ];
+    case "onedrive":
+      return [
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList OneDrive refresh_token",
+          multiline: true,
+          required: true,
+        },
+        {
+          key: "access_token",
+          label: "access_token（可选）",
+          placeholder: "留空也可以，保存时会在线刷新",
+          multiline: true,
+        },
+        {
+          key: "api_url_address",
+          label: "api_url_address（可选）",
+          placeholder: "https://api.oplist.org/onedrive/renewapi",
+          help: "默认使用 OpenList 的在线刷新 API；除非你有自建兼容服务，否则留空。",
+        },
+        {
+          key: "region",
+          label: "region（可选）",
+          placeholder: "global（可选：global / cn / us / de）",
+          help: "默认 global；世纪互联填 cn，美国政府云填 us，德国云填 de。",
+        },
+        {
+          key: "is_sharepoint",
+          label: "is_sharepoint（可选）",
+          placeholder: "false",
+          help: "普通 OneDrive 留空或 false；SharePoint 文档库填 true，并填写 site_id。",
+        },
+        {
+          key: "site_id",
+          label: "site_id（SharePoint 必填）",
+          placeholder: "SharePoint site id",
+        },
+      ];
   }
 }
 
 function defaultRootId(kind: Kind): string {
-  return kind === "pikpak" ? "" : "0";
+  if (kind === "pikpak") return "";
+  if (kind === "onedrive") return "root";
+  return "0";
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/onedrive"
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/quark"
@@ -108,6 +110,9 @@ func main() {
 		},
 		OnRegenPreview: func(videoID string) {
 			go app.regenPreview(ctx, videoID)
+		},
+		OnRegenAllPreviews: func() {
+			go app.regenAllPreviews(ctx)
 		},
 		GetPreviewEnabled: func() bool { return app.PreviewEnabled() },
 		SetPreviewEnabled: func(enabled bool) error {
@@ -272,6 +277,25 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 				_ = a.cat.UpsertDrive(ctx, d)
 			},
 		})
+	case "onedrive":
+		drv = onedrive.New(onedrive.Config{
+			ID:           d.ID,
+			RootID:       d.RootID,
+			Region:       d.Credentials["region"],
+			AccessToken:  d.Credentials["access_token"],
+			RefreshToken: d.Credentials["refresh_token"],
+			IsSharePoint: parseBoolDefault(d.Credentials["is_sharepoint"], false),
+			SiteID:       d.Credentials["site_id"],
+			RenewAPIURL:  d.Credentials["api_url_address"],
+			OnTokenUpdate: func(access, refresh string) {
+				if d.Credentials == nil {
+					d.Credentials = make(map[string]string)
+				}
+				d.Credentials["access_token"] = access
+				d.Credentials["refresh_token"] = refresh
+				_ = a.cat.UpsertDrive(ctx, d)
+			},
+		})
 	default:
 		return fmt.Errorf("unknown drive kind: %s", d.Kind)
 	}
@@ -306,19 +330,46 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 	go worker.Run(workerCtx)
 	go thumbWorker.Run(workerCtx)
 
+	a.registerPreviewWorkers(ctx, d.ID, worker, thumbWorker, cancel)
+
+	return nil
+}
+
+func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker, cancel context.CancelFunc) {
 	a.mu.Lock()
 	if a.cancels == nil {
 		a.cancels = make(map[string]context.CancelFunc)
 	}
-	if old, ok := a.cancels[d.ID]; ok {
+	if a.workers == nil {
+		a.workers = make(map[string]*preview.Worker)
+	}
+	if a.thumbWorkers == nil {
+		a.thumbWorkers = make(map[string]*preview.ThumbWorker)
+	}
+	if old, ok := a.cancels[driveID]; ok && old != nil {
 		old()
 	}
-	a.workers[d.ID] = worker
-	a.thumbWorkers[d.ID] = thumbWorker
-	a.cancels[d.ID] = cancel
+	if worker != nil {
+		a.workers[driveID] = worker
+	} else {
+		delete(a.workers, driveID)
+	}
+	if thumbWorker != nil {
+		a.thumbWorkers[driveID] = thumbWorker
+	} else {
+		delete(a.thumbWorkers, driveID)
+	}
+	if cancel != nil {
+		a.cancels[driveID] = cancel
+	} else {
+		delete(a.cancels, driveID)
+	}
+	previewEnabled := a.previewEnabled
 	a.mu.Unlock()
 
-	return nil
+	if previewEnabled && worker != nil {
+		go a.enqueuePending(ctx, driveID, worker)
+	}
 }
 
 func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Worker) {
@@ -332,7 +383,10 @@ func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Wor
 	}
 	log.Printf("[preview] enqueue %d pending videos for drive=%s", len(pending), driveID)
 	for _, v := range pending {
-		w.Enqueue(v)
+		if !w.EnqueueBlocking(ctx, v) {
+			log.Printf("[preview] enqueue pending canceled for drive=%s", driveID)
+			return
+		}
 	}
 }
 
@@ -347,7 +401,10 @@ func (a *App) enqueueThumbnails(ctx context.Context, driveID string, w *preview.
 	}
 	log.Printf("[thumb] enqueue %d missing thumbnails for drive=%s", len(pending), driveID)
 	for _, v := range pending {
-		w.Enqueue(v)
+		if !w.EnqueueBlocking(ctx, v) {
+			log.Printf("[thumb] enqueue missing thumbnails canceled for drive=%s", driveID)
+			return
+		}
 	}
 }
 
@@ -424,8 +481,36 @@ func (a *App) regenPreview(ctx context.Context, videoID string) {
 	worker := a.workers[v.DriveID]
 	a.mu.Unlock()
 	if worker != nil {
-		worker.Enqueue(v)
+		worker.EnqueueBlocking(ctx, v)
 	}
+}
+
+func (a *App) regenAllPreviews(ctx context.Context) {
+	items, total, err := a.cat.ListVideos(ctx, catalog.ListParams{Page: 1, PageSize: 1000000})
+	if err != nil {
+		log.Printf("[preview] list all videos for regen: %v", err)
+		return
+	}
+	log.Printf("[preview] enqueue all visible videos for regen count=%d total=%d", len(items), total)
+	queued := 0
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[preview] enqueue all canceled after %d videos: %v", queued, err)
+			return
+		}
+		a.mu.Lock()
+		worker := a.workers[v.DriveID]
+		a.mu.Unlock()
+		if worker == nil {
+			continue
+		}
+		if !worker.EnqueueBlocking(ctx, v) {
+			log.Printf("[preview] enqueue all canceled after %d videos", queued)
+			return
+		}
+		queued++
+	}
+	log.Printf("[preview] enqueued all visible videos for regen queued=%d", queued)
 }
 
 func (a *App) scanLoop(ctx context.Context) {
@@ -474,4 +559,15 @@ func originOr(r *http.Request, fallback string) string {
 		return o
 	}
 	return fallback
+}
+
+func parseBoolDefault(raw string, def bool) bool {
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return def
+	}
+	return v
 }

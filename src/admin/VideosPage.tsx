@@ -4,18 +4,32 @@ import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
 
+const PAGE_SIZE = 100;
+
 export function VideosPage() {
   const [list, setList] = useState<api.AdminVideo[]>([]);
+  const [drives, setDrives] = useState<api.AdminDrive[]>([]);
   const [loading, setLoading] = useState(true);
   const [keyword, setKeyword] = useState("");
+  const [driveId, setDriveId] = useState("");
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
   const [editing, setEditing] = useState<api.AdminVideo | null>(null);
+  const [availableTags, setAvailableTags] = useState<api.AdminTag[]>([]);
   const { show } = useToast();
 
   async function refresh() {
     setLoading(true);
     try {
-      const r = await api.listVideos();
+      const [r, tagList, driveList] = await Promise.all([
+        api.listVideos({ driveId, page, size: PAGE_SIZE }),
+        api.listTags(),
+        api.listDrives(),
+      ]);
       setList(r.items ?? []);
+      setTotal(r.total ?? 0);
+      setAvailableTags(tagList);
+      setDrives(driveList ?? []);
     } catch (e) {
       show(e instanceof Error ? e.message : "加载失败", "error");
     } finally {
@@ -25,18 +39,24 @@ export function VideosPage() {
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [driveId, page]);
+
+  const driveNameMap = new Map(
+    drives.map((d) => [d.id, d.name || d.id])
+  );
 
   const filtered = keyword.trim()
     ? list.filter((v) => {
         const k = keyword.toLowerCase();
         return (
           v.title.toLowerCase().includes(k) ||
-          (v.author ?? "").toLowerCase().includes(k) ||
-          v.id.toLowerCase().includes(k)
+          (v.author ?? "").toLowerCase().includes(k)
         );
       })
     : list;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
+  const pageEnd = Math.min(total, page * PAGE_SIZE);
 
   async function handleRegen(v: api.AdminVideo) {
     try {
@@ -52,6 +72,27 @@ export function VideosPage() {
       <header className="admin-page__header">
         <h1 className="admin-page__title">视频管理</h1>
         <div style={{ display: "flex", gap: 8 }}>
+          <select
+            value={driveId}
+            onChange={(e) => {
+              setDriveId(e.target.value);
+              setPage(1);
+            }}
+            style={{
+              border: "1px solid var(--color-line)",
+              borderRadius: 3,
+              minWidth: 180,
+              padding: "8px 10px",
+            }}
+          >
+            <option value="">全部网盘</option>
+            {drives.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.name || d.id}（已生成 {d.teaserReadyCount ?? 0}，待生成{" "}
+                {d.teaserPendingCount ?? 0}）
+              </option>
+            ))}
+          </select>
           <div
             style={{
               position: "relative",
@@ -70,7 +111,7 @@ export function VideosPage() {
             <input
               value={keyword}
               onChange={(e) => setKeyword(e.target.value)}
-              placeholder="搜索标题 / 作者 / ID"
+              placeholder="搜索标题 / 作者"
               style={{
                 padding: "8px 10px 8px 30px",
                 border: "1px solid var(--color-line)",
@@ -85,68 +126,155 @@ export function VideosPage() {
         </div>
       </header>
 
+      {drives.length > 0 && (
+        <div className="admin-drive-teasers" aria-label="网盘 Teaser 统计">
+          {drives.map((d) => (
+            <button
+              key={d.id}
+              type="button"
+              className={`admin-drive-teaser${
+                driveId === d.id ? " is-active" : ""
+              }`}
+              onClick={() => {
+                setDriveId(d.id);
+                setPage(1);
+              }}
+            >
+              <span className="admin-drive-teaser__name">{d.name || d.id}</span>
+              <span className="admin-drive-teaser__metric is-ready">
+                已生成 {d.teaserReadyCount ?? 0}
+              </span>
+              <span className="admin-drive-teaser__metric is-pending">
+                待生成 {d.teaserPendingCount ?? 0}
+              </span>
+              {(d.teaserFailedCount ?? 0) > 0 && (
+                <span className="admin-drive-teaser__metric is-failed">
+                  失败 {d.teaserFailedCount}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {!loading && (
+        <div className="admin-form__help" style={{ margin: "-10px 0 14px" }}>
+          {driveId
+            ? `${driveNameMap.get(driveId) ?? driveId}：共 ${total} 个视频，第 ${page} / ${totalPages} 页，显示 ${pageStart}-${pageEnd}`
+            : `全部网盘：共 ${total} 个视频，第 ${page} / ${totalPages} 页，显示 ${pageStart}-${pageEnd}`}
+        </div>
+      )}
+
       {loading ? (
         <div className="admin-empty">加载中...</div>
       ) : filtered.length === 0 ? (
         <div className="admin-card admin-empty">
-          还没有视频。先在「网盘管理」里配置好盘并触发扫描。
+          {driveId
+            ? "这个网盘下还没有可显示的视频。可以在「网盘管理」里触发重扫。"
+            : "还没有视频。先在「网盘管理」里配置好盘并触发扫描。"}
         </div>
       ) : (
-        <table className="admin-table">
-          <thead>
-            <tr>
-              <th>标题</th>
-              <th>作者</th>
-              <th>标签</th>
-              <th>时长</th>
-              <th>Teaser</th>
-              <th>来源</th>
-              <th className="is-actions">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((v) => (
-              <tr key={v.id}>
-                <td>
-                  <div style={{ fontWeight: 600 }}>{v.title}</div>
-                  <div style={{ color: "#999", fontSize: 12, fontFamily: "ui-monospace" }}>
-                    {v.id}
-                  </div>
-                </td>
-                <td>{v.author || <span style={{ color: "#aaa" }}>—</span>}</td>
-                <td>
-                  <div className="admin-pills">
-                    {(v.tags ?? []).map((t) => (
-                      <span key={t} className="admin-pill">
-                        {t}
-                      </span>
-                    ))}
-                  </div>
-                </td>
-                <td>{formatDur(v.durationSeconds)}</td>
-                <td>
-                  <PreviewStatus s={v.previewStatus} />
-                </td>
-                <td style={{ fontFamily: "ui-monospace", fontSize: 12 }}>
-                  {v.driveId}
-                </td>
-                <td className="is-actions">
-                  <button className="admin-btn" onClick={() => setEditing(v)}>
-                    <Edit size={13} /> 编辑
-                  </button>{" "}
-                  <button className="admin-btn" onClick={() => handleRegen(v)}>
-                    <RefreshCw size={13} /> 重生 teaser
-                  </button>
-                </td>
+        <>
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>标题</th>
+                <th>作者</th>
+                <th>标签</th>
+                <th>时长</th>
+                <th>Teaser</th>
+                <th>来源</th>
+                <th className="is-actions">操作</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {filtered.map((v) => (
+                <tr key={v.id}>
+                  <td>
+                    <div style={{ fontWeight: 600 }}>{v.title}</div>
+                    {fileMeta(v) && (
+                      <div style={{ color: "#999", fontSize: 12 }}>
+                        {fileMeta(v)}
+                      </div>
+                    )}
+                  </td>
+                  <td>{v.author || <span style={{ color: "#aaa" }}>—</span>}</td>
+                  <td>
+                    <div className="admin-pills">
+                      {(v.tags ?? []).map((t) => (
+                        <span key={t} className="admin-pill">
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                  <td>{formatDur(v.durationSeconds)}</td>
+                  <td>
+                    <PreviewStatus s={v.previewStatus} />
+                  </td>
+                  <td style={{ fontFamily: "ui-monospace", fontSize: 12 }}>
+                    {driveNameMap.get(v.driveId) ?? v.driveId}
+                  </td>
+                  <td className="is-actions">
+                    <button className="admin-btn" onClick={() => setEditing(v)}>
+                      <Edit size={13} /> 编辑
+                    </button>{" "}
+                    <button className="admin-btn" onClick={() => handleRegen(v)}>
+                      <RefreshCw size={13} /> 重生 teaser
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              alignItems: "center",
+              gap: 8,
+              marginTop: 12,
+            }}
+          >
+            <button
+              className="admin-btn"
+              onClick={() => setPage(1)}
+              disabled={page <= 1}
+            >
+              首页
+            </button>
+            <button
+              className="admin-btn"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+            >
+              上一页
+            </button>
+            <span className="admin-form__help" style={{ margin: 0 }}>
+              第 {page} / {totalPages} 页，每页 {PAGE_SIZE} 个
+            </span>
+            <button
+              className="admin-btn"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages}
+            >
+              下一页
+            </button>
+            <button
+              className="admin-btn"
+              onClick={() => setPage(totalPages)}
+              disabled={page >= totalPages}
+            >
+              末页
+            </button>
+          </div>
+        </>
       )}
 
       {editing && (
         <EditVideoModal
           video={editing}
+          availableTags={availableTags}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
@@ -173,16 +301,18 @@ function formatDur(sec: number): string {
 
 function EditVideoModal({
   video,
+  availableTags,
   onClose,
   onSaved,
 }: {
   video: api.AdminVideo;
+  availableTags: api.AdminTag[];
   onClose: () => void;
   onSaved: () => void;
 }) {
   const [title, setTitle] = useState(video.title);
   const [author, setAuthor] = useState(video.author ?? "");
-  const [tags, setTags] = useState((video.tags ?? []).join(", "));
+  const [selectedTags, setSelectedTags] = useState(video.tags ?? []);
   const [category, setCategory] = useState(video.category ?? "");
   const [badges, setBadges] = useState((video.badges ?? []).join(", "));
   const [description, setDescription] = useState(video.description ?? "");
@@ -198,7 +328,7 @@ function EditVideoModal({
       await api.updateVideo(video.id, {
         title: title.trim(),
         author: author.trim(),
-        tags: splitList(tags),
+        tags: selectedTags,
         category: category.trim(),
         badges: splitList(badges),
         description,
@@ -241,8 +371,20 @@ function EditVideoModal({
           <input value={author} onChange={(e) => setAuthor(e.target.value)} />
         </div>
         <div className="admin-form__row">
-          <label>标签（逗号分隔）</label>
-          <input value={tags} onChange={(e) => setTags(e.target.value)} />
+          <label>标签</label>
+          <div className="admin-tag-picker">
+            {availableTags.map((tag) => (
+              <label key={tag.id} className="admin-check">
+                <input
+                  type="checkbox"
+                  checked={selectedTags.includes(tag.label)}
+                  onChange={() => setSelectedTags(toggleTag(selectedTags, tag.label))}
+                />
+                <span>{tag.label}</span>
+                <em>{tag.count}</em>
+              </label>
+            ))}
+          </div>
         </div>
         <div className="admin-form__row">
           <label>分类</label>
@@ -280,20 +422,54 @@ function EditVideoModal({
           />
         </div>
         <dl className="admin-kv" style={{ marginTop: 8 }}>
-          <dt>视频 ID</dt>
-          <dd style={{ fontFamily: "ui-monospace", fontSize: 12 }}>{video.id}</dd>
           <dt>来源盘</dt>
           <dd>{video.driveId}</dd>
-          <dt>文件 ID</dt>
-          <dd style={{ fontFamily: "ui-monospace", fontSize: 12 }}>{video.fileId}</dd>
+          <dt>文件信息</dt>
+          <dd>{fileMeta(video) || "—"}</dd>
           <dt>Teaser</dt>
           <dd>
             <PreviewStatus s={video.previewStatus} />
           </dd>
         </dl>
+        <details className="admin-form__help" style={{ marginTop: 8 }}>
+          <summary>技术信息（排查用）</summary>
+          <dl className="admin-kv" style={{ marginTop: 8 }}>
+            <dt>内部视频 ID</dt>
+            <dd style={{ fontFamily: "ui-monospace", fontSize: 12 }}>{video.id}</dd>
+            <dt>网盘文件 ID</dt>
+            <dd style={{ fontFamily: "ui-monospace", fontSize: 12 }}>{video.fileId}</dd>
+          </dl>
+        </details>
       </div>
     </Modal>
   );
+}
+
+function fileMeta(v: api.AdminVideo): string {
+  const parts = [
+    normalizeExt(v.ext),
+    v.quality,
+    formatBytes(v.size),
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function normalizeExt(ext: string): string {
+  const value = (ext ?? "").replace(/^\./, "").trim();
+  return value ? value.toUpperCase() : "";
+}
+
+function formatBytes(size: number): string {
+  if (!size || size <= 0) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = size;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || value >= 100 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unit]}`;
 }
 
 function splitList(s: string): string[] {
@@ -301,4 +477,10 @@ function splitList(s: string): string[] {
     .split(/[,，、\s]+/)
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+function toggleTag(tags: string[], label: string): string[] {
+  return tags.includes(label)
+    ? tags.filter((tag) => tag !== label)
+    : [...tags, label];
 }

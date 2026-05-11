@@ -2,6 +2,10 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Link } from "react-router-dom";
 import type { PreviewState, VideoItem } from "@/types";
 import { previewController } from "@/lib/previewController";
+import {
+  shouldInterceptPreviewTap,
+  shouldStartInstantPreview,
+} from "@/lib/previewIntent";
 import { useInViewport } from "@/lib/useInViewport";
 import { formatCount } from "@/lib/format";
 import { PreviewVideo } from "./PreviewVideo";
@@ -29,6 +33,8 @@ export function VideoCard({ video }: Props) {
   const rootRef = useRef<HTMLElement | null>(null);
   const hoverTimerRef = useRef<number | null>(null);
   const thumbnailRetryTimerRef = useRef<number | null>(null);
+  const lastPointerTypeRef = useRef<string>("");
+  const canHoverRef = useRef(true);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   const activeId = useActivePreviewId();
@@ -59,6 +65,16 @@ export function VideoCard({ video }: Props) {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(hover: hover) and (pointer: fine)");
+    const update = () => {
+      canHoverRef.current = media.matches;
+    };
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
   }, []);
 
   useEffect(() => {
@@ -112,34 +128,77 @@ export function VideoCard({ video }: Props) {
 
   function startPreviewIntent() {
     if (!inView) return;
+    if (hoverTimerRef.current) return;
     setPreviewState("intent");
 
     hoverTimerRef.current = window.setTimeout(() => {
-      // 抢占全局播放锁
-      previewController.setActiveId(video.id);
-      setShouldRenderPreview(true);
-      setPreviewState("loading");
+      hoverTimerRef.current = null;
+      startPreviewNow({ requireInView: true });
     }, HOVER_DELAY_MS);
+  }
+
+  function startPreviewNow(options: { requireInView: boolean }) {
+    if (options.requireInView && !inView) return;
+    if (hoverTimerRef.current) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+    previewController.setActiveId(video.id);
+    setShouldRenderPreview(true);
+    setPreviewState("loading");
   }
 
   function stopPreview() {
     cleanup();
   }
 
-  // 移动端：首次点击卡片触发预览，浮层播放按钮跳转详情
-  // 为了让 Link 正常跳转，我们不拦截移动端点击，移动端表现为直接跳转详情
-  // 如需长按预览，后续可在此扩展
+  function handlePointerEnter(event: React.PointerEvent<HTMLElement>) {
+    lastPointerTypeRef.current = event.pointerType;
+    if (shouldStartInstantPreview({ pointerType: event.pointerType })) return;
+    startPreviewIntent();
+  }
+
+  function handlePointerLeave(event: React.PointerEvent<HTMLElement>) {
+    if (shouldStartInstantPreview({ pointerType: event.pointerType })) return;
+    stopPreview();
+  }
+
+  function handlePointerDown(event: React.PointerEvent<HTMLElement>) {
+    lastPointerTypeRef.current = event.pointerType;
+  }
+
+  function handleClickCapture(event: React.MouseEvent<HTMLAnchorElement>) {
+    const previewActive = activeId === video.id && shouldRenderPreview;
+    if (
+      !shouldInterceptPreviewTap({
+        pointerType: lastPointerTypeRef.current,
+        canHover: canHoverRef.current,
+        previewActive,
+      })
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    startPreviewNow({ requireInView: false });
+  }
 
   return (
     <article
       ref={rootRef as React.RefObject<HTMLElement>}
       className="video-card"
-      onPointerEnter={startPreviewIntent}
-      onPointerLeave={stopPreview}
+      onPointerEnter={handlePointerEnter}
+      onPointerLeave={handlePointerLeave}
+      onPointerDown={handlePointerDown}
       onFocus={startPreviewIntent}
       onBlur={stopPreview}
     >
-      <Link to={video.href} className="video-card__link" tabIndex={0}>
+      <Link
+        to={video.href}
+        className="video-card__link"
+        tabIndex={0}
+        onClickCapture={handleClickCapture}
+      >
         <div className="thumb-frame">
           <img
             className="thumb-image"

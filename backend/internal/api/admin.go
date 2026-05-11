@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 
@@ -14,10 +16,11 @@ type AdminServer struct {
 	Catalog *catalog.Catalog
 	Auth    *auth.Authenticator
 	// Hooks：外层注入实际执行者
-	OnDriveSaved    func(driveID string) error
-	OnDriveRemoved  func(driveID string)
-	OnScanRequested func(driveID string)
-	OnRegenPreview  func(videoID string)
+	OnDriveSaved       func(driveID string) error
+	OnDriveRemoved     func(driveID string)
+	OnScanRequested    func(driveID string)
+	OnRegenPreview     func(videoID string)
+	OnRegenAllPreviews func()
 	// Preview 开关读写
 	GetPreviewEnabled func() bool
 	SetPreviewEnabled func(enabled bool) error
@@ -43,7 +46,12 @@ func (a *AdminServer) Register(r chi.Router) {
 			// 视频
 			r.Get("/videos", a.handleAdminListVideos)
 			r.Put("/videos/{id}", a.handleUpdateVideo)
+			r.Post("/videos/regen-preview", a.handleRegenAllPreviews)
 			r.Post("/videos/{id}/regen-preview", a.handleRegenPreview)
+
+			// 标签
+			r.Get("/tags", a.handleListTags)
+			r.Post("/tags", a.handleCreateTag)
 
 			// 运行时设置
 			r.Get("/settings", a.handleGetSettings)
@@ -96,24 +104,36 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	teaserCounts, err := a.Catalog.CountTeasersByDrive(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	// 出参不返回凭证明文，只告诉前端是否已配置
 	type out struct {
-		ID          string `json:"id"`
-		Kind        string `json:"kind"`
-		Name        string `json:"name"`
-		RootID      string `json:"rootId"`
-		ScanRootID  string `json:"scanRootId"`
-		Status      string `json:"status"`
-		LastError   string `json:"lastError,omitempty"`
-		HasCredential bool `json:"hasCredential"`
+		ID                 string `json:"id"`
+		Kind               string `json:"kind"`
+		Name               string `json:"name"`
+		RootID             string `json:"rootId"`
+		ScanRootID         string `json:"scanRootId"`
+		Status             string `json:"status"`
+		LastError          string `json:"lastError,omitempty"`
+		HasCredential      bool   `json:"hasCredential"`
+		TeaserReadyCount   int    `json:"teaserReadyCount"`
+		TeaserPendingCount int    `json:"teaserPendingCount"`
+		TeaserFailedCount  int    `json:"teaserFailedCount"`
 	}
 	list := make([]out, 0, len(drives))
 	for _, d := range drives {
+		counts := teaserCounts[d.ID]
 		list = append(list, out{
 			ID: d.ID, Kind: d.Kind, Name: d.Name,
 			RootID: d.RootID, ScanRootID: d.ScanRootID,
 			Status: d.Status, LastError: d.LastError,
-			HasCredential: len(d.Credentials) > 0,
+			HasCredential:      len(d.Credentials) > 0,
+			TeaserReadyCount:   counts.Ready,
+			TeaserPendingCount: counts.Pending,
+			TeaserFailedCount:  counts.Failed,
 		})
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -183,14 +203,61 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *AdminServer) handleAdminListVideos(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	size, _ := strconv.Atoi(q.Get("size"))
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 || size > 100 {
+		size = 100
+	}
 	items, total, err := a.Catalog.ListVideos(r.Context(), catalog.ListParams{
-		Page: 1, PageSize: 100,
+		DriveID:  q.Get("driveId"),
+		Page:     page,
+		PageSize: size,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items,
+		"total": total,
+		"page":  page,
+		"size":  size,
+	})
+}
+
+func (a *AdminServer) handleListTags(w http.ResponseWriter, r *http.Request) {
+	tags, err := a.Catalog.ListTags(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tags)
+}
+
+type createTagReq struct {
+	Label   string   `json:"label"`
+	Aliases []string `json:"aliases"`
+}
+
+func (a *AdminServer) handleCreateTag(w http.ResponseWriter, r *http.Request) {
+	var body createTagReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	classified, err := a.Catalog.CreateTagAndClassify(r.Context(), body.Label, body.Aliases, "user")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"label":      body.Label,
+		"classified": classified,
+	})
 }
 
 type updateVideoReq struct {
@@ -223,9 +290,6 @@ func (a *AdminServer) handleUpdateVideo(w http.ResponseWriter, r *http.Request) 
 	if body.Author != "" {
 		v.Author = body.Author
 	}
-	if body.Tags != nil {
-		v.Tags = body.Tags
-	}
 	if body.Category != "" {
 		v.Category = body.Category
 	}
@@ -248,6 +312,21 @@ func (a *AdminServer) handleUpdateVideo(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	if body.Tags != nil {
+		if err := a.Catalog.SetManualVideoTags(r.Context(), id, body.Tags); err != nil {
+			if errors.Is(err, catalog.ErrUnknownTag) {
+				writeErr(w, http.StatusBadRequest, err)
+				return
+			}
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		v, err = a.Catalog.GetVideo(r.Context(), id)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -255,6 +334,13 @@ func (a *AdminServer) handleRegenPreview(w http.ResponseWriter, r *http.Request)
 	id := chi.URLParam(r, "id")
 	if a.OnRegenPreview != nil {
 		a.OnRegenPreview(id)
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleRegenAllPreviews(w http.ResponseWriter, r *http.Request) {
+	if a.OnRegenAllPreviews != nil {
+		a.OnRegenAllPreviews()
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }

@@ -91,9 +91,24 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 		if parsed.Title == "" {
 			parsed.Title = strings.TrimSuffix(e.Name, ext)
 		}
+		tags := parsed.Tags
+		if matched, err := s.Catalog.MatchTags(ctx, e.Name+" "+dirName+" "+parsed.Author); err == nil {
+			tags = mergeTags(tags, matched)
+		}
+		if label, ok, err := s.Catalog.EnsureCollectionTag(ctx, dirName); err == nil && ok {
+			tags = mergeTags(tags, []string{label})
+		}
 
 		existing, _ := s.Catalog.GetVideo(ctx, id)
 		if existing != nil {
+			if e.Hash != "" && existing.ContentHash == "" {
+				_ = s.Catalog.UpdateVideoMeta(ctx, id, catalog.VideoMetaPatch{ContentHash: e.Hash})
+				existing.ContentHash = e.Hash
+			}
+			if dup := s.findDuplicateByHash(ctx, e.Hash, id); dup != nil {
+				s.backfillDuplicateThumbnail(ctx, dup, e.ThumbnailURL)
+				continue
+			}
 			// 已存在但轻量元数据空缺时，顺便补齐。
 			patch := catalog.VideoMetaPatch{}
 			if existing.Category == "" && dirName != "" {
@@ -102,13 +117,17 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 			if existing.ThumbnailURL == "" && e.ThumbnailURL != "" {
 				patch.ThumbnailURL = e.ThumbnailURL
 			}
-			if !sameTags(existing.Tags, parsed.Tags) {
-				patch.Tags = parsed.Tags
-				patch.TagsSet = true
-			}
-			if patch.Category != "" || patch.ThumbnailURL != "" || patch.TagsSet {
+			if patch.Category != "" || patch.ThumbnailURL != "" {
 				_ = s.Catalog.UpdateVideoMeta(ctx, id, patch)
 			}
+			if !sameTags(existing.Tags, tags) {
+				_ = s.Catalog.SetAutoVideoTags(ctx, id, tags)
+			}
+			continue
+		}
+
+		if dup := s.findDuplicateByHash(ctx, e.Hash, id); dup != nil {
+			s.backfillDuplicateThumbnail(ctx, dup, e.ThumbnailURL)
 			continue
 		}
 
@@ -117,10 +136,11 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 			ID:            id,
 			DriveID:       s.Drive.ID(),
 			FileID:        e.ID,
+			ContentHash:   e.Hash,
 			ParentID:      e.ParentID,
 			Title:         parsed.Title,
 			Author:        parsed.Author,
-			Tags:          parsed.Tags,
+			Tags:          tags,
 			Ext:           strings.TrimPrefix(ext, "."),
 			Quality:       "HD",
 			Size:          e.Size,
@@ -143,6 +163,24 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 	return nil
 }
 
+func (s *Scanner) findDuplicateByHash(ctx context.Context, hash, currentID string) *catalog.Video {
+	if hash == "" {
+		return nil
+	}
+	dup, err := s.Catalog.FindVideoByContentHash(ctx, hash)
+	if err != nil || dup == nil || dup.ID == currentID {
+		return nil
+	}
+	return dup
+}
+
+func (s *Scanner) backfillDuplicateThumbnail(ctx context.Context, canonical *catalog.Video, thumbnailURL string) {
+	if canonical.ThumbnailURL != "" || thumbnailURL == "" {
+		return
+	}
+	_ = s.Catalog.UpdateVideoMeta(ctx, canonical.ID, catalog.VideoMetaPatch{ThumbnailURL: thumbnailURL})
+}
+
 func orDefault(t time.Time, d time.Time) time.Time {
 	if t.IsZero() {
 		return d
@@ -160,4 +198,19 @@ func sameTags(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func mergeTags(lists ...[]string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, list := range lists {
+		for _, tag := range list {
+			if tag == "" || seen[tag] {
+				continue
+			}
+			seen[tag] = true
+			out = append(out, tag)
+		}
+	}
+	return out
 }

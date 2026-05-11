@@ -5,7 +5,7 @@ import (
 	"unicode"
 )
 
-var Labels = []string{"后入", "奶子", "口交", "臀", "人妻", "女大"}
+var Labels = []string{"后入", "奶子", "口交", "臀", "人妻", "女大", "AV"}
 
 var aliases = map[string][]string{
 	"后入": {"后入", "後入", "后入式", "後入式", "后进", "後進", "后位", "後位", "背入", "背后", "后背", "背后式", "后背位", "狗爬", "狗爬式", "追尾", "doggy", "doggystyle", "doggy style", "doggy-style", "backshot", "back shot", "back-shot", "from behind", "rear entry"},
@@ -14,6 +14,14 @@ var aliases = map[string][]string{
 	"臀":  {"臀", "屁股", "屁屁", "翘臀", "美臀", "肥臀", "巨臀", "蜜桃臀", "大屁股", "尻", "后庭", "後庭", "菊花", "肛", "肛交", "屁眼", "ass", "big ass", "big-ass", "butt", "big butt", "big-butt", "booty", "buttocks", "hip"},
 	"人妻": {"人妻", "妻子", "老婆", "太太", "少妇", "少熟", "熟女", "已婚", "良家", "人妇", "人夫", "wife", "housewife", "married", "married woman", "young wife", "milf"},
 	"女大": {"女大", "女大学生", "大学生", "女子大生", "大学", "女学生", "学生妹", "校花", "学妹", "校园", "大一", "大二", "大三", "大四", "college", "college student", "university", "university student", "campus", "coed"},
+	"AV": {"AV", "JAV", "番号", "番號"},
+}
+
+func AliasesFor(label string) []string {
+	values := aliases[label]
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
 }
 
 func MatchFilename(name string) []string {
