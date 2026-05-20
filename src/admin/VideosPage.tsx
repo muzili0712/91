@@ -166,7 +166,7 @@ export function VideosPage() {
             <tbody>
               {filtered.map((v) => (
                 <tr key={v.id}>
-                  <td>
+                  <td data-label="标题">
                     <div className="admin-video-title">{v.title}</div>
                     {fileMeta(v) && (
                       <div className="admin-video-filemeta">
@@ -174,8 +174,8 @@ export function VideosPage() {
                       </div>
                     )}
                   </td>
-                  <td>{v.author || <span className="admin-text-faint">—</span>}</td>
-                  <td>
+                  <td data-label="作者">{v.author || <span className="admin-text-faint">—</span>}</td>
+                  <td data-label="标签">
                     <div className="admin-pills">
                       {(v.tags ?? []).map((t) => (
                         <span key={t} className="admin-pill">
@@ -184,14 +184,14 @@ export function VideosPage() {
                       ))}
                     </div>
                   </td>
-                  <td>{formatDur(v.durationSeconds)}</td>
-                  <td>
+                  <td data-label="时长">{formatDur(v.durationSeconds)}</td>
+                  <td data-label="Teaser">
                     <PreviewStatus s={v.previewStatus} />
                   </td>
-                  <td className="admin-mono-cell">
+                  <td data-label="来源" className="admin-mono-cell">
                     {driveNameMap.get(v.driveId) ?? v.driveId}
                   </td>
-                  <td className="is-actions">
+                  <td className="is-actions" data-label="操作">
                     <button className="admin-btn" onClick={() => setEditing(v)}>
                       <Edit size={13} /> 编辑
                     </button>{" "}

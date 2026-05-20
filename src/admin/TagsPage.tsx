@@ -101,12 +101,12 @@ export function TagsPage() {
           <tbody>
             {tags.map((tag) => (
               <tr key={tag.id}>
-                <td>
+                <td data-label="标签">
                   <span className="admin-pill">{tag.label}</span>
                 </td>
-                <td>{tag.count}</td>
-                <td>{sourceLabel(tag.source)}</td>
-                <td>
+                <td data-label="视频数">{tag.count}</td>
+                <td data-label="来源">{sourceLabel(tag.source)}</td>
+                <td data-label="别名">
                   {(tag.aliases ?? []).length > 0 ? (
                     <div className="admin-pills">
                       {(tag.aliases ?? []).map((alias) => (
