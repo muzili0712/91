@@ -57,7 +57,11 @@ type Config struct {
 	// KeepLatestN 是每个 spider91 drive 在本地保留的最新视频数。
 	// 超过的部分中"已迁移"的会被清理；未迁移的不动。0 时默认 15；< 0 关闭清理。
 	KeepLatestN int
-	OnMigrated  func(videoID string)
+	// CaptchaCooldown 是迁移 worker 在遇到 PikPak captcha 错误（error_code
+	// 4002 / 9）后整体进入冷却的时长。冷却期间 runOnce 直接返回，不再发起任何
+	// PikPak API 请求，避免被进一步风控。0 时默认 5 分钟；< 0 关闭冷却（仅用于测试）。
+	CaptchaCooldown time.Duration
+	OnMigrated      func(videoID string)
 }
 
 type Migrator struct {
@@ -65,6 +69,15 @@ type Migrator struct {
 	trigger chan struct{}
 	mu      sync.Mutex
 	running bool
+
+	// cooldownMu 保护 cooldownUntil。captcha 冷却的语义：
+	//   - migrateDrive 遇到上传失败且 pikpak.IsCaptchaError(err) == true 时
+	//     调 setCooldown，未来 cfg.CaptchaCooldown 内 runOnce 直接 noop
+	//   - 一次冷却期内只打印一行进入日志和一行恢复日志，避免之前那种
+	//     "每秒一条 4002" 的刷屏
+	cooldownMu     sync.Mutex
+	cooldownUntil  time.Time
+	cooldownLogged bool
 }
 
 func New(cfg Config) *Migrator {
@@ -77,10 +90,64 @@ func New(cfg Config) *Migrator {
 	if cfg.KeepLatestN == 0 {
 		cfg.KeepLatestN = 15
 	}
+	if cfg.CaptchaCooldown == 0 {
+		cfg.CaptchaCooldown = 5 * time.Minute
+	}
 	return &Migrator{
 		cfg:     cfg,
 		trigger: make(chan struct{}, 1),
 	}
+}
+
+// inCooldown 返回当前是否处于 captcha 冷却期，以及冷却结束时间。
+// 冷却期间应该跳过整个 runOnce —— 不要列盘、不要尝试上传，
+// 让 PikPak 喘口气。
+func (m *Migrator) inCooldown() (bool, time.Time) {
+	m.cooldownMu.Lock()
+	defer m.cooldownMu.Unlock()
+	return time.Now().Before(m.cooldownUntil), m.cooldownUntil
+}
+
+// cooldownState 返回当前冷却状态。若发现冷却已经过期，会清掉状态并让
+// 调用方打印一次恢复日志。
+func (m *Migrator) cooldownState() (active bool, until time.Time, resumed bool) {
+	m.cooldownMu.Lock()
+	defer m.cooldownMu.Unlock()
+	if m.cooldownUntil.IsZero() {
+		return false, time.Time{}, false
+	}
+	until = m.cooldownUntil
+	if time.Now().Before(until) {
+		return true, until, false
+	}
+	m.cooldownUntil = time.Time{}
+	m.cooldownLogged = false
+	return false, until, true
+}
+
+// setCooldown 把冷却结束时间往后推 cfg.CaptchaCooldown，并返回结束时间。
+// 当 cfg.CaptchaCooldown < 0（仅测试用）时不改任何状态、返回零值。
+func (m *Migrator) setCooldown() time.Time {
+	if m.cfg.CaptchaCooldown < 0 {
+		return time.Time{}
+	}
+	m.cooldownMu.Lock()
+	defer m.cooldownMu.Unlock()
+	m.cooldownUntil = time.Now().Add(m.cfg.CaptchaCooldown)
+	m.cooldownLogged = false
+	return m.cooldownUntil
+}
+
+// markCooldownLogged 是 runOnce 用来只打一次"在冷却中"日志的小工具。
+// 第一次返回 false（应该打），第二次起返回 true（不再打），冷却到期 / 重新设置时复位。
+func (m *Migrator) markCooldownLogged() bool {
+	m.cooldownMu.Lock()
+	defer m.cooldownMu.Unlock()
+	if m.cooldownLogged {
+		return true
+	}
+	m.cooldownLogged = true
+	return false
 }
 
 // Trigger 安排一次"立即跑"。多次调用会被合并成一次（channel buffer=1）。
@@ -95,16 +162,54 @@ func (m *Migrator) Trigger() {
 func (m *Migrator) Run(ctx context.Context) {
 	t := time.NewTicker(m.cfg.Interval)
 	defer t.Stop()
+	var cooldownTimer *time.Timer
+	var cooldownC <-chan time.Time
+	stopCooldownTimer := func() {
+		if cooldownTimer == nil {
+			return
+		}
+		if !cooldownTimer.Stop() {
+			select {
+			case <-cooldownTimer.C:
+			default:
+			}
+		}
+		cooldownTimer = nil
+		cooldownC = nil
+	}
+	resetCooldownTimer := func() {
+		stopCooldownTimer()
+		active, until := m.inCooldown()
+		if !active {
+			return
+		}
+		delay := time.Until(until)
+		if delay < 0 {
+			delay = 0
+		}
+		cooldownTimer = time.NewTimer(delay)
+		cooldownC = cooldownTimer.C
+	}
+	defer stopCooldownTimer()
+
 	// 启动后立刻跑一次（不等第一个 tick）
 	m.runOnce(ctx)
+	resetCooldownTimer()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			m.runOnce(ctx)
+			resetCooldownTimer()
 		case <-m.trigger:
 			m.runOnce(ctx)
+			resetCooldownTimer()
+		case <-cooldownC:
+			cooldownTimer = nil
+			cooldownC = nil
+			m.runOnce(ctx)
+			resetCooldownTimer()
 		}
 	}
 }
@@ -126,6 +231,18 @@ func (m *Migrator) runOnce(ctx context.Context) {
 		m.mu.Unlock()
 	}()
 
+	// captcha 冷却期间整轮跳过 —— 不做任何 PikPak API 调用、不做本地清理，
+	// 等冷却结束。这样从用户视角看：进入冷却 → 一行日志 → 完全静默 → 冷却
+	// 结束自然恢复。避免之前每秒一条 4002 的日志雪崩。
+	if active, until, resumed := m.cooldownState(); active {
+		if !m.markCooldownLogged() {
+			log.Printf("[spider91migrate] captcha cooldown active until %s, skipping run", until.Format(time.RFC3339))
+		}
+		return
+	} else if resumed {
+		log.Printf("[spider91migrate] captcha cooldown ended at %s, resuming migration", until.Format(time.RFC3339))
+	}
+
 	target, pp, err := m.resolveTarget()
 	if err != nil {
 		// 没目标就静默 —— 用户可能还没配 PikPak drive
@@ -142,6 +259,12 @@ func (m *Migrator) runOnce(ctx context.Context) {
 			log.Printf("[spider91migrate] drive=%s migrate batch error: %v", src.ID(), err)
 		}
 		migrated += n
+		if active, _ := m.inCooldown(); active {
+			if migrated > 0 {
+				log.Printf("[spider91migrate] migrated %d video(s) to drive=%s", migrated, target)
+			}
+			return
+		}
 	}
 	if migrated > 0 {
 		log.Printf("[spider91migrate] migrated %d video(s) to drive=%s", migrated, target)
@@ -215,8 +338,8 @@ func (m *Migrator) spider91Drives() []*spider91.Driver {
 //   - 列出 spider91 drive 本地 videos/ 目录所有 mp4 文件，按 mtime 降序排
 //   - 跳过最新 KeepLatestN 个：这些是用户希望保留在本地的最新爬取
 //   - 对剩下的（更旧）逐个处理：
-//     * 还没迁移（drive_id 仍是 src.ID()）→ 上传到 PikPak + 改 catalog + 删本地
-//     * 已经迁移过但本地还有残留 → 仅删本地（兜底）
+//   - 还没迁移（drive_id 仍是 src.ID()）→ 上传到 PikPak + 改 catalog + 删本地
+//   - 已经迁移过但本地还有残留 → 仅删本地（兜底）
 //
 // KeepLatestN < 0 时不保护任何本地文件，全部尝试迁移（旧行为，主要给测试用）。
 func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targetDriveID string, pp pikpakUploader) (int, error) {
@@ -296,6 +419,15 @@ func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targe
 		ok, err := m.migrateOne(ctx, v, src, targetDriveID, pp)
 		if err != nil {
 			log.Printf("[spider91migrate] %s: %v", v.ID, err)
+			// captcha 错误（4002 / 9）说明 PikPak 当前正拒绝我们；继续在
+			// 同一轮里尝试其它文件大概率会拿到同样的 4002，并且每多一次
+			// 失败就多一份"被风控加深"的风险。立即中止当前 batch 并
+			// 打开冷却窗口，等 cfg.CaptchaCooldown 之后再重试。
+			if pikpak.IsCaptchaError(err) {
+				until := m.setCooldown()
+				log.Printf("[spider91migrate] drive=%s captcha-blocked, cooling down until %s", src.ID(), until.Format(time.RFC3339))
+				return migrated, nil
+			}
 			continue
 		}
 		if ok {

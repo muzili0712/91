@@ -1,6 +1,7 @@
 package pikpak
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -56,6 +57,28 @@ func (e *errResp) isError() bool {
 
 func (e *errResp) Error() string {
 	return fmt.Sprintf("pikpak error_code=%d error=%s description=%s", e.ErrorCode, e.ErrorMsg, e.ErrorDescription)
+}
+
+// APIError is the public alias for the PikPak API error response. Callers
+// outside this package (e.g. the spider91→PikPak migrator, tests) can either
+// construct it for fakes or unwrap it via errors.As. Prefer IsCaptchaError
+// over hard-coding the numeric error codes.
+type APIError = errResp
+
+// IsCaptchaError reports whether err originates from a PikPak captcha-related
+// API error (error_code 4002 = captcha_token expired; 9 = captcha_invalid).
+//
+// It walks the error chain via errors.As, so the caller can wrap the original
+// error with fmt.Errorf("...: %w", err) without breaking detection.
+func IsCaptchaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *errResp
+	if errors.As(err, &e) {
+		return e != nil && (e.ErrorCode == 4002 || e.ErrorCode == 9)
+	}
+	return false
 }
 
 type captchaTokenRequest struct {

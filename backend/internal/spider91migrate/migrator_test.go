@@ -70,9 +70,9 @@ func (d *fakePikPak) ID() string   { return d.id }
 func (d *fakePikPak) RootID() string {
 	return d.rootID
 }
-func (d *fakePikPak) Init(context.Context) error                            { return nil }
-func (d *fakePikPak) List(context.Context, string) ([]drives.Entry, error)  { return nil, nil }
-func (d *fakePikPak) Stat(context.Context, string) (*drives.Entry, error)   { return nil, nil }
+func (d *fakePikPak) Init(context.Context) error                           { return nil }
+func (d *fakePikPak) List(context.Context, string) ([]drives.Entry, error) { return nil, nil }
+func (d *fakePikPak) Stat(context.Context, string) (*drives.Entry, error)  { return nil, nil }
 func (d *fakePikPak) StreamURL(context.Context, string) (*drives.StreamLink, error) {
 	return nil, drives.ErrNotSupported
 }
@@ -113,7 +113,9 @@ var _ pikpakUploader = (*fakePikPak)(nil)
 // TestBackfillFileNamesRenamesOnlyMismatchedSpider91Videos 验证回填逻辑：
 //
 //   - 已经是期望格式的不会再调 Rename（幂等）
+//
 //   - 名字仍是旧格式的 spider91-* 视频会被改名 + catalog 同步
+//
 //   - 不是 spider91-* 的 PikPak 视频不动（避免误伤手工导入的）
 //
 //   - 反复跑 runOnce 不会再重复改名
@@ -642,3 +644,252 @@ func TestRunOnceMigratesOnlyOlderFilesBeyondKeepWindow(t *testing.T) {
 	}
 }
 
+// TestRunOnceCoolsDownOnCaptchaErrorAndAbortsBatch 验证当 PikPak 返回
+// captcha 错误（4002 / 9）时：
+//
+//  1. migrateDrive 立即放弃当前 batch，不继续遍历后续候选；
+//  2. migrator 进入 cooldown，下一次 runOnce 直接 noop，不再发起任何上传；
+//  3. cooldown 到期后 runOnce 自然恢复，不需要外部干预。
+//
+// 这个测试覆盖之前观察到的 "每秒一条 4002 日志雪崩" bug：当时 batch 里 50 个
+// 文件每个都会触发同样的 captcha 失败，本测试断言其中只有 1 个会被尝试。
+func TestRunOnceCoolsDownOnCaptchaErrorAndAbortsBatch(t *testing.T) {
+	cat := setupCatalog(t)
+	src, _ := setupSpider91(t)
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	pp.uploadFunc = func(ctx context.Context, parentID, name string, r io.Reader, size int64) (pikpak.UploadResult, error) {
+		_, _ = io.Copy(io.Discard, r)
+		// 模拟真实 PikPak 4002 错误：通过包装 *pikpak.APIError，
+		// pikpak.IsCaptchaError 应该能识别出来。
+		captcha := &pikpak.APIError{ErrorCode: 4002, ErrorMsg: "captcha_invalid", ErrorDescription: "Code(4002) - captcha_token expired"}
+		return pikpak.UploadResult{}, fmt.Errorf("pikpak upload: request session: %w", captcha)
+	}
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	now := time.Now()
+	// 写 5 个本地文件，全都"够老"应该被迁。KeepLatestN=-1 关闭保留窗口，
+	// 让所有候选都进 batch 循环。
+	for i := 0; i < 5; i++ {
+		viewkey := fmt.Sprintf("vk-cd-%02d", i)
+		mtime := now.Add(time.Duration(-i) * time.Hour)
+		_ = writeSpider91Video(t, cat, src, viewkey, ".mp4", []byte("payload"), mtime)
+		path, _ := src.VideoPath(viewkey + ".mp4")
+		_ = os.Chtimes(path, mtime, mtime)
+	}
+
+	m := New(Config{
+		Catalog:          cat,
+		Registry:         reg,
+		GetTargetDriveID: func() string { return pp.ID() },
+		KeepLatestN:      -1,
+		CaptchaCooldown:  10 * time.Minute,
+	})
+
+	// 第一次 runOnce：应该在第 1 个文件失败时就退出 batch，且进入冷却。
+	m.runOnce(context.Background())
+	if pp.uploadCalls != 1 {
+		t.Fatalf("after first runOnce upload calls = %d, want 1 (batch should abort on captcha error)", pp.uploadCalls)
+	}
+	if active, _ := m.inCooldown(); !active {
+		t.Fatalf("expected migrator to be in cooldown after captcha error")
+	}
+
+	// 第二次 runOnce：应该完全 noop，因为还在冷却期。
+	m.runOnce(context.Background())
+	if pp.uploadCalls != 1 {
+		t.Fatalf("after second runOnce upload calls = %d, want 1 (cooldown should skip the run)", pp.uploadCalls)
+	}
+
+	// catalog 行不能被改 —— 上传失败的文件保持在 spider91 drive
+	for i := 0; i < 5; i++ {
+		viewkey := fmt.Sprintf("vk-cd-%02d", i)
+		id := "spider91-" + src.ID() + "-" + viewkey
+		v, _ := cat.GetVideo(context.Background(), id)
+		if v.DriveID != src.ID() {
+			t.Errorf("%s drive_id = %q, want spider91 (upload failed, catalog should stay)", viewkey, v.DriveID)
+		}
+		// 本地文件也不能被删
+		path, _ := src.VideoPath(viewkey + ".mp4")
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s local file removed despite failed upload: %v", viewkey, err)
+		}
+	}
+}
+
+// TestRunOnceResumesAfterCooldownExpires 验证冷却到期后 runOnce 可以继续工作。
+//
+// 用 cfg.CaptchaCooldown = 50ms，set 完冷却立即等 60ms，第二次 runOnce 应该重新
+// 进入正常路径。这里把 uploadFunc 换成成功版本，验证整条链路通畅。
+func TestRunOnceResumesAfterCooldownExpires(t *testing.T) {
+	cat := setupCatalog(t)
+	src, _ := setupSpider91(t)
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+
+	// 第一次：失败；第二次：成功。
+	var failOnce sync.Once
+	pp.uploadFunc = func(ctx context.Context, parentID, name string, r io.Reader, size int64) (pikpak.UploadResult, error) {
+		body, _ := io.ReadAll(r)
+		var failed bool
+		failOnce.Do(func() { failed = true })
+		if failed {
+			captcha := &pikpak.APIError{ErrorCode: 4002, ErrorMsg: "captcha_invalid"}
+			return pikpak.UploadResult{}, fmt.Errorf("pikpak upload: request session: %w", captcha)
+		}
+		pp.mu.Lock()
+		pp.gotBodies[name] = body
+		pp.mu.Unlock()
+		return pikpak.UploadResult{
+			FileID: "remote-" + name,
+			Hash:   "FAKEHASH40CHARSXXXXXXXXXXXXXXXXXXXXXXXXX",
+			Size:   int64(len(body)),
+		}, nil
+	}
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	now := time.Now()
+	_ = writeSpider91Video(t, cat, src, "vk-resume", ".mp4", []byte("payload"), now)
+
+	m := New(Config{
+		Catalog:          cat,
+		Registry:         reg,
+		GetTargetDriveID: func() string { return pp.ID() },
+		KeepLatestN:      -1,
+		CaptchaCooldown:  30 * time.Millisecond,
+	})
+
+	// 第一次：失败 + 进入冷却
+	m.runOnce(context.Background())
+	if pp.uploadCalls != 1 {
+		t.Fatalf("first run upload calls = %d, want 1", pp.uploadCalls)
+	}
+	if active, _ := m.inCooldown(); !active {
+		t.Fatalf("expected cooldown after first failure")
+	}
+
+	// 等冷却到期
+	time.Sleep(80 * time.Millisecond)
+	if active, _ := m.inCooldown(); active {
+		t.Fatalf("cooldown should have expired by now")
+	}
+
+	// 第二次：成功
+	m.runOnce(context.Background())
+	if pp.uploadCalls != 2 {
+		t.Fatalf("second run upload calls = %d, want 2 (resume after cooldown)", pp.uploadCalls)
+	}
+	id := "spider91-" + src.ID() + "-vk-resume"
+	v, _ := cat.GetVideo(context.Background(), id)
+	if v.DriveID != pp.ID() {
+		t.Fatalf("after resume, drive_id = %q, want PikPak", v.DriveID)
+	}
+}
+
+// TestRunWakesWhenCooldownExpires 验证 Run 循环会在 cooldown 到点后主动唤醒
+// 一次迁移，而不是等下一个普通 interval tick。
+func TestRunWakesWhenCooldownExpires(t *testing.T) {
+	cat := setupCatalog(t)
+	src, _ := setupSpider91(t)
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+
+	migrated := make(chan struct{}, 1)
+	var failOnce sync.Once
+	pp.uploadFunc = func(ctx context.Context, parentID, name string, r io.Reader, size int64) (pikpak.UploadResult, error) {
+		body, _ := io.ReadAll(r)
+		var failed bool
+		failOnce.Do(func() { failed = true })
+		if failed {
+			captcha := &pikpak.APIError{ErrorCode: 4002, ErrorMsg: "captcha_invalid"}
+			return pikpak.UploadResult{}, fmt.Errorf("pikpak upload: request session: %w", captcha)
+		}
+		pp.mu.Lock()
+		pp.gotBodies[name] = body
+		pp.mu.Unlock()
+		return pikpak.UploadResult{
+			FileID: "remote-" + name,
+			Hash:   "FAKEHASH40CHARSXXXXXXXXXXXXXXXXXXXXXXXXX",
+			Size:   int64(len(body)),
+		}, nil
+	}
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	now := time.Now()
+	id := writeSpider91Video(t, cat, src, "vk-auto-resume", ".mp4", []byte("payload"), now)
+
+	m := New(Config{
+		Catalog:          cat,
+		Registry:         reg,
+		GetTargetDriveID: func() string { return pp.ID() },
+		Interval:         time.Hour,
+		KeepLatestN:      -1,
+		CaptchaCooldown:  30 * time.Millisecond,
+		OnMigrated: func(videoID string) {
+			if videoID == id {
+				select {
+				case migrated <- struct{}{}:
+				default:
+				}
+			}
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Run(ctx)
+
+	select {
+	case <-migrated:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("Run did not resume migration after cooldown expired")
+	}
+
+	got, err := cat.GetVideo(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DriveID != pp.ID() {
+		t.Fatalf("after auto resume, drive_id = %q, want PikPak", got.DriveID)
+	}
+}
+
+// TestNonCaptchaErrorDoesNotTriggerCooldown 验证非 captcha 类的上传错误（如
+// 网络抖动）不会让整个 worker 进冷却 —— 只跳过这一条，继续尝试 batch 里其它的。
+func TestNonCaptchaErrorDoesNotTriggerCooldown(t *testing.T) {
+	cat := setupCatalog(t)
+	src, _ := setupSpider91(t)
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	pp.uploadFunc = func(ctx context.Context, parentID, name string, r io.Reader, size int64) (pikpak.UploadResult, error) {
+		_, _ = io.Copy(io.Discard, r)
+		return pikpak.UploadResult{}, errors.New("simulated network failure")
+	}
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		viewkey := fmt.Sprintf("vk-net-%02d", i)
+		_ = writeSpider91Video(t, cat, src, viewkey, ".mp4", []byte("payload"), now.Add(time.Duration(-i)*time.Hour))
+	}
+
+	m := New(Config{
+		Catalog:          cat,
+		Registry:         reg,
+		GetTargetDriveID: func() string { return pp.ID() },
+		KeepLatestN:      -1,
+	})
+	m.runOnce(context.Background())
+
+	// 所有 3 个都被尝试（每个都失败，但不应触发冷却中止 batch）
+	if pp.uploadCalls != 3 {
+		t.Fatalf("upload calls = %d, want 3 (non-captcha errors should not abort batch)", pp.uploadCalls)
+	}
+	if active, _ := m.inCooldown(); active {
+		t.Fatalf("non-captcha error should not trigger cooldown")
+	}
+}

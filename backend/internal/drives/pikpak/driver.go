@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -43,6 +44,14 @@ type Driver struct {
 
 	client        *resty.Client
 	onTokenUpdate func(access, refresh, captcha, deviceID string)
+
+	// captchaMu serializes captcha-token refreshes triggered by 4002 / 9
+	// recovery in requestOnce. Without it, N concurrent callers all hitting
+	// 4002 at once would each post to /v1/shield/captcha/init, racing to
+	// overwrite d.captchaToken — wasteful and likely to be flagged by
+	// PikPak as abuse. With it, only one refresh is in flight; later
+	// callers observe d.captchaToken has changed and skip the refresh.
+	captchaMu sync.Mutex
 }
 
 type Config struct {
@@ -279,14 +288,26 @@ func (d *Driver) requestOnce(ctx context.Context, url, method string, configure 
 			}
 		case 9, 4002:
 			if retry {
-				// 4002 = captcha_token expired；先清掉缓存让 refresh 走空 token 路径，
-				// 否则 refresh 仍会带着同一个过期 token 再次拿到 4002。
-				// 9 = 通用 captcha_invalid，刷新后通常能恢复。
-				if e.ErrorCode == 4002 {
-					d.captchaToken = ""
+				// Snapshot the token we *just used* (which the server rejected).
+				// Then take captchaMu so concurrent recovery attempts are
+				// serialized. Once we hold the lock, if d.captchaToken has
+				// already moved past staleToken, another goroutine has refreshed
+				// it for us — we skip the refresh and just retry. Otherwise we
+				// clear the cached token (4002 means "the value in the body is
+				// expired"; sending it again will keep returning 4002) and ask
+				// /v1/shield/captcha/init for a fresh one.
+				staleToken := d.captchaToken
+				d.captchaMu.Lock()
+				var refreshErr error
+				if d.captchaToken == staleToken {
+					if e.ErrorCode == 4002 {
+						d.captchaToken = ""
+					}
+					refreshErr = d.refreshCaptchaTokenAtLogin(ctx, getAction(method, url), d.userID)
 				}
-				if err := d.refreshCaptchaTokenAtLogin(ctx, getAction(method, url), d.userID); err != nil {
-					return err
+				d.captchaMu.Unlock()
+				if refreshErr != nil {
+					return refreshErr
 				}
 				return d.requestOnce(ctx, url, method, configure, out, false)
 			}
