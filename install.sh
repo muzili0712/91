@@ -324,8 +324,8 @@ exec_latest_manager_update() {
 }
 
 open_firewall_port() {
-  [[ "$CONFIGURE_UFW" == "1" ]] || return
-  command -v ufw >/dev/null 2>&1 || return
+  [[ "$CONFIGURE_UFW" == "1" ]] || return 0
+  command -v ufw >/dev/null 2>&1 || return 0
   if ufw status 2>/dev/null | grep -qi "Status: active"; then
     log "allowing ${FRONTEND_PORT}/tcp in UFW"
     ufw allow "${FRONTEND_PORT}/tcp"
@@ -379,7 +379,7 @@ stop_app_services() {
 }
 
 remove_app_containers() {
-  command -v docker >/dev/null 2>&1 || return
+  command -v docker >/dev/null 2>&1 || return 0
 
   local names=()
   local name
@@ -400,8 +400,8 @@ remove_app_containers() {
 
 pids_listening_on_port() {
   local port="$1"
-  [[ "$port" =~ ^[0-9]+$ ]] || return
-  command -v ss >/dev/null 2>&1 || return
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  command -v ss >/dev/null 2>&1 || return 0
 
   ss -ltnp 2>/dev/null \
     | awk -v port="$port" '$4 ~ ":" port "$" {print}' \
@@ -474,7 +474,7 @@ warn_remaining_listeners() {
 }
 
 has_interactive_tty() {
-  [[ -r /dev/tty && -w /dev/tty ]]
+  [[ -t 0 ]]
 }
 
 confirm_uninstall_app() {
