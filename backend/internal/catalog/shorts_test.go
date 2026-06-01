@@ -110,6 +110,62 @@ func TestRandomVideosExcluding(t *testing.T) {
 	}
 }
 
+func TestRandomVideosWithReadyThumbnailsExcluding(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for i := 0; i < 4; i++ {
+		id := "ready-" + string(rune('a'+i))
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID:           id,
+			DriveID:      "drive",
+			FileID:       "f-" + id,
+			Title:        id,
+			ThumbnailURL: "/p/thumb/" + id,
+			PublishedAt:  now,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		id := "pending-" + string(rune('a'+i))
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID:          id,
+			DriveID:     "drive",
+			FileID:      "f-" + id,
+			Title:       id,
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	got, err := cat.RandomVideosWithReadyThumbnailsExcluding(ctx, []string{"ready-a"}, 10)
+	if err != nil {
+		t.Fatalf("random ready excluding: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("ready random count = %d, want 3", len(got))
+	}
+	for _, v := range got {
+		if v.ID == "ready-a" {
+			t.Fatal("excluded ready video was returned")
+		}
+		if v.ThumbnailURL == "" {
+			t.Fatalf("pending video %q was returned", v.ID)
+		}
+	}
+}
+
 func TestRandomVideosForPreferredVideoChoosesLeastPopulatedTag(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")

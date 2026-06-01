@@ -166,6 +166,59 @@ func TestHandleHomePrioritizesVideosWithReadyThumbnails(t *testing.T) {
 	}
 }
 
+func TestHandleHomeExcludesRecentlyShownVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for i := 0; i < homePageSize+4; i++ {
+		id := "ready-video-" + strconv.Itoa(i)
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:           id,
+			DriveID:      "drive",
+			FileID:       id,
+			Title:        id,
+			ThumbnailURL: "https://thumb.example/" + id + ".jpg",
+			PublishedAt:  now.Add(time.Duration(i) * time.Minute),
+			CreatedAt:    now.Add(time.Duration(i) * time.Minute),
+			UpdatedAt:    now.Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatalf("seed ready video %s: %v", id, err)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/home?exclude=ready-video-0&exclude=ready-video-1", nil)
+	(&Server{Catalog: cat}).handleHome(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got []VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != homePageSize {
+		t.Fatalf("home items = %d, want %d", len(got), homePageSize)
+	}
+	for _, item := range got {
+		if item.ID == "ready-video-0" || item.ID == "ready-video-1" {
+			t.Fatalf("home returned excluded video %q; items=%#v", item.ID, got)
+		}
+		if !strings.HasPrefix(item.ID, "ready-video-") {
+			t.Fatalf("home returned %q without a ready thumbnail; items=%#v", item.ID, got)
+		}
+	}
+}
+
 func TestHandleListLatestPrefersReadyThumbnails(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

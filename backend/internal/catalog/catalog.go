@@ -932,6 +932,14 @@ func (c *Catalog) CountVisibleVideos(ctx context.Context) (int, error) {
 // 如果剩余可选数量 < limit，就返回所有可选项；调用方负责判断是否需要开新一轮。
 // limit <= 0 时返回 nil, nil。
 func (c *Catalog) RandomVideosExcluding(ctx context.Context, excludeIDs []string, limit int) ([]*Video, error) {
+	return c.randomVideosExcluding(ctx, excludeIDs, limit, false)
+}
+
+func (c *Catalog) RandomVideosWithReadyThumbnailsExcluding(ctx context.Context, excludeIDs []string, limit int) ([]*Video, error) {
+	return c.randomVideosExcluding(ctx, excludeIDs, limit, true)
+}
+
+func (c *Catalog) randomVideosExcluding(ctx context.Context, excludeIDs []string, limit int, thumbnailReadyOnly bool) ([]*Video, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -940,6 +948,9 @@ func (c *Catalog) RandomVideosExcluding(ctx context.Context, excludeIDs []string
 	args := make([]any, 0, len(cleaned)+1)
 	whereSQL := `WHERE COALESCE(hidden, 0) = 0
 		           AND ` + uniqueVideoWhereSQL
+	if thumbnailReadyOnly {
+		whereSQL += " AND COALESCE(thumbnail_url, '') != ''"
+	}
 	if len(cleaned) > 0 {
 		placeholders := strings.Repeat("?,", len(cleaned))
 		placeholders = placeholders[:len(placeholders)-1]
