@@ -10,6 +10,8 @@ import type { VideoItem } from "@/types";
 
 const DESKTOP_COUNT = 12;
 const MOBILE_COUNT = 8;
+const HOME_RECENT_KEY = "home.random.recentVideoIds";
+const HOME_RECENT_LIMIT = 72;
 
 function useIsMobile() {
   const [mobile, setMobile] = useState(window.innerWidth <= 640);
@@ -26,6 +28,35 @@ function useIsMobile() {
 let cachedRanking: VideoItem[] | null = null;
 let cachedLatest: VideoItem[] | null = null;
 
+function loadRecentHomeVideoIds(): string[] {
+  try {
+    const raw = window.localStorage.getItem(HOME_RECENT_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberHomeVideos(items: VideoItem[]) {
+  const merged = [...items.map((item) => item.id), ...loadRecentHomeVideoIds()];
+  const seen = new Set<string>();
+  const recent: string[] = [];
+  for (const id of merged) {
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    recent.push(id);
+    if (recent.length >= HOME_RECENT_LIMIT) break;
+  }
+  try {
+    window.localStorage.setItem(HOME_RECENT_KEY, JSON.stringify(recent));
+  } catch {
+    // localStorage 不可用时只影响连续刷新去重，不影响首页展示。
+  }
+}
+
 export default function HomePage() {
   const [rankingVideos, setRankingVideos] = useState<VideoItem[]>(cachedRanking ?? []);
   const [latestVideos, setLatestVideos] = useState<VideoItem[]>(cachedLatest ?? []);
@@ -40,11 +71,13 @@ export default function HomePage() {
 
     let active = true;
     setLoading(true);
+    const excludeIds = loadRecentHomeVideoIds();
     Promise.all([
-      fetchHomeVideos(),
+      fetchHomeVideos(excludeIds),
       fetchListing(1, DESKTOP_COUNT, { sort: "latest" }),
     ]).then(([rankingItems, latestResult]) => {
       if (!active) return;
+      rememberHomeVideos(rankingItems);
       cachedRanking = rankingItems;
       cachedLatest = latestResult.items;
       setRankingVideos(rankingItems);

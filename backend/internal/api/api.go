@@ -156,39 +156,58 @@ func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	// 首页优先展示封面已经生成好的视频，避免新盘扫盘时大量黑封面占满首页。
-	// 候选仍按发布时间覆盖最近 200 个，随后随机洗牌；封面不足时再用普通可见视频补齐。
-	const candidatePool = 200
-	readyItems, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
-		Sort: "latest", Page: 1, PageSize: candidatePool, ThumbnailReadyOnly: true,
-	})
+	// 首页优先从全量已有封面的视频里随机抽取，避免只在最近一小段候选中反复出现。
+	excludeIDs := parseVideoIDQuery(r, "exclude", 120)
+	items, err := s.Catalog.RandomVideosWithReadyThumbnailsExcluding(r.Context(), excludeIDs, homePageSize)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	rand.Shuffle(len(readyItems), func(i, j int) {
-		readyItems[i], readyItems[j] = readyItems[j], readyItems[i]
-	})
-
-	items := appendUniqueVideos(nil, readyItems, homePageSize)
-	if len(items) > homePageSize {
-		items = items[:homePageSize]
-	}
 	if len(items) < homePageSize {
-		fallback, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
-			Sort: "latest", Page: 1, PageSize: candidatePool,
-		})
+		fallbackExclude := append([]string{}, excludeIDs...)
+		for _, item := range items {
+			if item != nil {
+				fallbackExclude = append(fallbackExclude, item.ID)
+			}
+		}
+		fallback, err := s.Catalog.RandomVideosExcluding(r.Context(), fallbackExclude, homePageSize-len(items))
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		rand.Shuffle(len(fallback), func(i, j int) {
-			fallback[i], fallback[j] = fallback[j], fallback[i]
-		})
 		items = appendUniqueVideos(items, fallback, homePageSize)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, mapVideos(items))
+}
+
+func parseVideoIDQuery(r *http.Request, key string, limit int) []string {
+	if r == nil {
+		return nil
+	}
+	values := r.URL.Query()[key]
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, id := range strings.Split(value, ",") {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+			if limit > 0 && len(out) >= limit {
+				return out
+			}
+		}
+	}
+	return out
 }
 
 func appendUniqueVideos(dst []*catalog.Video, candidates []*catalog.Video, limit int) []*catalog.Video {
