@@ -10,6 +10,7 @@ import {
 import {
   Activity,
   AlertTriangle,
+  Check,
   ChevronDown,
   CircleStop,
   Download,
@@ -160,7 +161,6 @@ export function CrawlersPage() {
       <header className="admin-page__header">
         <div>
           <h1 className="admin-page__title">爬虫管理</h1>
-          <p className="admin-page__subtitle">导入符合协议的 Python 脚本，自动抓取视频并生成封面、预览和指纹</p>
         </div>
         <div className="admin-detail-actions-inline">
           <button className="admin-btn" onClick={() => refresh()} disabled={loading}>
@@ -510,6 +510,7 @@ function GenStageCard({
 
 type EditorForm = {
   scriptPath: string;
+  scriptSourceUrl: string;
   name: string;
   targetNew: string;
   proxy: string;
@@ -530,9 +531,19 @@ function CrawlerEditorModal({
   onSaved: () => void;
 }) {
   const isEdit = crawler !== null;
-  const [form, setForm] = useState<EditorForm>({ scriptPath: "", name: "", targetNew: "10", proxy: "", uploadDriveId: "" });
+  const [form, setForm] = useState<EditorForm>({
+    scriptPath: "",
+    scriptSourceUrl: "",
+    name: "",
+    targetNew: "10",
+    proxy: "",
+    uploadDriveId: "",
+  });
   const [scriptURL, setScriptURL] = useState("");
   const [importing, setImporting] = useState(false);
+  const [replacingScript, setReplacingScript] = useState(false);
+  // 已通过原链接拉取过新脚本（路径不变，内容已更新）
+  const [scriptUpdated, setScriptUpdated] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<api.CrawlerDryRunResult | null>(null);
   const [saving, setSaving] = useState(false);
@@ -544,6 +555,7 @@ function CrawlerEditorModal({
     if (!open) return;
     setForm({
       scriptPath: crawler?.scriptPath ?? "",
+      scriptSourceUrl: crawler?.scriptSourceUrl ?? "",
       name: crawler?.name ?? "",
       targetNew: crawler?.targetNew || "10",
       proxy: crawler?.proxy ?? "",
@@ -552,10 +564,28 @@ function CrawlerEditorModal({
     setScriptURL("");
     setTestResult(null);
     setDragOver(false);
+    setReplacingScript(false);
+    setScriptUpdated(false);
   }, [open, crawler]);
+
+  // 编辑模式下默认收起导入区，点「替换脚本」再展开
+  const showImportArea = !isEdit || replacingScript;
+  const scriptChanged = form.scriptPath !== (crawler?.scriptPath ?? "");
 
   function set<K extends keyof EditorForm>(key: K, value: EditorForm[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function cancelReplace() {
+    setForm((prev) => ({
+      ...prev,
+      scriptPath: crawler?.scriptPath ?? "",
+      scriptSourceUrl: crawler?.scriptSourceUrl ?? "",
+      name: crawler?.name ?? "",
+    }));
+    setScriptURL("");
+    setTestResult(null);
+    setReplacingScript(false);
   }
 
   async function importFile(file: File | null | undefined) {
@@ -567,8 +597,7 @@ function CrawlerEditorModal({
     setImporting(true);
     try {
       const resp = await api.importCrawlerScriptFile(file);
-      set("scriptPath", resp.scriptPath);
-      set("name", resp.name);
+      setForm((prev) => ({ ...prev, scriptPath: resp.scriptPath, name: resp.name, scriptSourceUrl: "" }));
       setTestResult(null);
       show("脚本已导入", "success");
     } catch (e) {
@@ -587,13 +616,39 @@ function CrawlerEditorModal({
     setImporting(true);
     try {
       const resp = await api.importCrawlerScriptURL(url);
-      set("scriptPath", resp.scriptPath);
-      set("name", resp.name);
+      setForm((prev) => ({
+        ...prev,
+        scriptPath: resp.scriptPath,
+        name: resp.name,
+        scriptSourceUrl: resp.sourceUrl || url,
+      }));
       setScriptURL("");
       setTestResult(null);
-      show("脚本已导入", "success");
+      show("脚本已导入，保存后可随时从原链接更新", "success");
     } catch (e) {
       show(e instanceof Error ? e.message : "导入失败", "error");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function updateFromSource() {
+    const url = form.scriptSourceUrl.trim();
+    if (!url) return;
+    setImporting(true);
+    try {
+      const resp = await api.importCrawlerScriptURL(url);
+      setForm((prev) => ({
+        ...prev,
+        scriptPath: resp.scriptPath,
+        name: resp.name,
+        scriptSourceUrl: resp.sourceUrl || url,
+      }));
+      setTestResult(null);
+      setScriptUpdated(true);
+      show("已从原链接拉取最新脚本", "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "从原链接更新失败", "error");
     } finally {
       setImporting(false);
     }
@@ -637,6 +692,7 @@ function CrawlerEditorModal({
       const resp = await api.upsertCrawler({
         id: crawler?.id,
         scriptPath: form.scriptPath.trim(),
+        scriptSourceUrl: form.scriptSourceUrl.trim(),
         targetNew: target,
         proxy: form.proxy.trim(),
         uploadDriveId: form.uploadDriveId,
@@ -661,6 +717,16 @@ function CrawlerEditorModal({
     importFile(e.dataTransfer.files?.[0]);
   }
 
+  const footerNote = !form.scriptPath
+    ? { text: "导入脚本后才能保存", tone: "" }
+    : testResult?.ok
+      ? { text: "测试通过", tone: "is-ok" }
+      : testResult
+        ? { text: "测试未通过，建议检查脚本", tone: "is-error" }
+        : scriptChanged || scriptUpdated
+          ? { text: "建议先运行测试再保存", tone: "" }
+          : null;
+
   return (
     <Modal
       open={open}
@@ -669,6 +735,7 @@ function CrawlerEditorModal({
       className="admin-modal--crawler"
       footer={
         <>
+          {footerNote && <span className={`admin-modal__footer-note ${footerNote.tone}`}>{footerNote.text}</span>}
           <button type="button" className="admin-btn" onClick={onClose} disabled={saving}>
             取消
           </button>
@@ -678,130 +745,235 @@ function CrawlerEditorModal({
         </>
       }
     >
-      <div className="admin-crawler-steps">
-        <section className="admin-crawler-step">
-          <header className="admin-crawler-step__head">
-            <span className="admin-crawler-step__num">1</span>
-            <div>
-              <strong>导入脚本</strong>
-              <span>上传 .py 文件或粘贴脚本链接，脚本需实现统一抓取协议</span>
-            </div>
-          </header>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".py,text/x-python"
-            hidden
-            onChange={(e) => {
-              importFile(e.target.files?.[0]);
-              e.currentTarget.value = "";
-            }}
+      <div className="admin-crawler-editor">
+        <div className="admin-crawler-editor__summary" aria-label="爬虫配置状态">
+          <CrawlerEditorSummaryItem
+            label="脚本"
+            value={form.scriptPath ? form.name || "已导入" : "未导入"}
+            tone={form.scriptPath ? "ok" : "muted"}
+            icon={<FileCode2 size={13} />}
           />
-          <div
-            className={`admin-crawler-dropzone${dragOver ? " is-dragover" : ""}${importing ? " is-busy" : ""}`}
-            role="button"
-            tabIndex={0}
-            onClick={() => !importing && fileInputRef.current?.click()}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                if (!importing) fileInputRef.current?.click();
-              }
-            }}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={onDrop}
-          >
-            <Upload size={20} />
-            <strong>{importing ? "导入中..." : "点击或拖拽 .py 脚本到此处上传"}</strong>
-          </div>
-          <div className="admin-crawler-urlrow">
+          <CrawlerEditorSummaryItem
+            label="测试"
+            value={testResult?.ok ? "已通过" : testResult ? "未通过" : "未测试"}
+            tone={testResult?.ok ? "ok" : testResult ? "error" : "muted"}
+            icon={<TestTube size={13} />}
+          />
+          <CrawlerEditorSummaryItem
+            label="每轮新增"
+            value={`${form.targetNew.trim() || "10"} 条`}
+            tone="muted"
+            icon={<Download size={13} />}
+          />
+        </div>
+
+        <div className="admin-crawler-editor__grid">
+          <section className="admin-crawler-panel admin-crawler-panel--script">
+            <header className="admin-crawler-panel__head">
+              <span className="admin-crawler-panel__icon">
+                <FileCode2 size={15} />
+              </span>
+              <div>
+                <strong>脚本来源</strong>
+                <span>{isEdit ? "管理当前脚本或替换版本" : "选择本地文件或脚本链接"}</span>
+              </div>
+            </header>
+
             <input
-              value={scriptURL}
-              onChange={(e) => setScriptURL(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  importURL();
-                }
+              ref={fileInputRef}
+              type="file"
+              accept=".py,text/x-python"
+              hidden
+              onChange={(e) => {
+                importFile(e.target.files?.[0]);
+                e.currentTarget.value = "";
               }}
-              placeholder="https://example.com/crawler.py"
-              disabled={importing}
-              aria-label="脚本链接"
             />
-            <button className="admin-btn" type="button" onClick={importURL} disabled={importing}>
-              <LinkIcon size={13} /> 链接导入
-            </button>
-          </div>
-          {form.scriptPath && (
-            <div className="admin-crawler-script-chip">
-              <FileCode2 size={14} />
-              <strong>{form.name || "未命名脚本"}</strong>
-              <span>{form.scriptPath}</span>
-            </div>
-          )}
-        </section>
 
-        <section className="admin-crawler-step">
-          <header className="admin-crawler-step__head">
-            <span className="admin-crawler-step__num">2</span>
-            <div>
-              <strong>测试脚本</strong>
-              <span>模拟抓取一条视频，校验协议字段和直链可用性（推荐）</span>
-            </div>
-          </header>
-          <div>
-            <button className="admin-btn" type="button" onClick={test} disabled={!form.scriptPath || importing || testing}>
-              <TestTube size={13} /> {testing ? "测试中..." : "运行测试"}
-            </button>
-          </div>
-          {testResult && <CrawlerTestResult result={testResult} />}
-        </section>
+            {form.scriptPath && (
+              <div className={`admin-crawler-current-script${isEdit && scriptChanged ? " is-replaced" : ""}`}>
+                <div className="admin-crawler-current-script__main">
+                  <span className="admin-crawler-current-script__icon">
+                    <FileCode2 size={16} />
+                  </span>
+                  <div>
+                    <div className="admin-crawler-current-script__title">
+                      <strong>{form.name || "未命名脚本"}</strong>
+                      {isEdit && scriptChanged && <em>新脚本</em>}
+                      {isEdit && !scriptChanged && scriptUpdated && <em>已更新</em>}
+                    </div>
+                  </div>
+                </div>
 
-        <section className="admin-crawler-step">
-          <header className="admin-crawler-step__head">
-            <span className="admin-crawler-step__num">3</span>
-            <div>
-              <strong>运行参数</strong>
-              <span>留空使用默认值</span>
-            </div>
-          </header>
-          <div className="admin-crawler-params">
-            <div className="admin-form__row">
-              <label htmlFor="crawler-target">每次新增视频数</label>
-              <input
-                id="crawler-target"
-                type="number"
-                min={1}
-                value={form.targetNew}
-                onChange={(e) => set("targetNew", e.target.value)}
-                placeholder="10"
-              />
-            </div>
-            <div className="admin-form__row">
-              <label htmlFor="crawler-proxy">代理地址</label>
-              <input
-                id="crawler-proxy"
-                value={form.proxy}
-                onChange={(e) => {
-                  set("proxy", e.target.value);
-                  setTestResult(null);
-                }}
-                placeholder="http://127.0.0.1:7890"
-              />
-            </div>
-            <Spider91UploadTargetField
-              value={form.uploadDriveId}
-              onChange={(value) => set("uploadDriveId", value)}
-              uploadTargets={uploadTargets}
-            />
+                {isEdit && (
+                  <div className="admin-crawler-current-script__actions">
+                    {replacingScript ? (
+                      <button type="button" className="admin-btn" onClick={cancelReplace} disabled={importing}>
+                        取消替换
+                      </button>
+                    ) : (
+                      <>
+                        {form.scriptSourceUrl && (
+                          <button
+                            type="button"
+                            className="admin-btn"
+                            onClick={updateFromSource}
+                            disabled={importing}
+                            title={`从 ${form.scriptSourceUrl} 重新拉取脚本`}
+                          >
+                            <RefreshCw size={12} className={importing ? "admin-spin" : undefined} />
+                            {importing ? "更新中..." : "从原链接更新"}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="admin-btn"
+                          onClick={() => {
+                            setScriptURL(form.scriptSourceUrl);
+                            setReplacingScript(true);
+                          }}
+                        >
+                          <Upload size={12} /> 替换脚本
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {showImportArea && (
+              <div className="admin-crawler-import-box">
+                <div
+                  className={`admin-crawler-dropzone${dragOver ? " is-dragover" : ""}${importing ? " is-busy" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => !importing && fileInputRef.current?.click()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (!importing) fileInputRef.current?.click();
+                    }
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setDragOver(true);
+                  }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={onDrop}
+                >
+                  <Upload size={20} />
+                  <strong>{importing ? "导入中..." : "上传 .py 脚本"}</strong>
+                  <span>点击选择或拖拽到这里</span>
+                </div>
+
+                <div className="admin-crawler-link-import">
+                  <label htmlFor="crawler-script-url">脚本链接</label>
+                  <div className="admin-crawler-urlrow">
+                    <input
+                      id="crawler-script-url"
+                      value={scriptURL}
+                      onChange={(e) => setScriptURL(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          importURL();
+                        }
+                      }}
+                      placeholder="https://example.com/crawler.py"
+                      disabled={importing}
+                    />
+                    <button className="admin-btn" type="button" onClick={importURL} disabled={importing}>
+                      <LinkIcon size={13} /> 链接导入
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+
+          <div className="admin-crawler-editor__side">
+            <section className="admin-crawler-panel">
+              <header className="admin-crawler-panel__head">
+                <span className="admin-crawler-panel__icon">
+                  <TestTube size={15} />
+                </span>
+                <div>
+                  <strong>测试脚本</strong>
+                  <span>保存前验证抓取结果</span>
+                </div>
+              </header>
+              <button className="admin-btn" type="button" onClick={test} disabled={!form.scriptPath || importing || testing}>
+                <TestTube size={13} /> {testing ? "测试中..." : testResult ? "重新测试" : "运行测试"}
+              </button>
+              {testResult && <CrawlerTestResult result={testResult} />}
+            </section>
+
+            <section className="admin-crawler-panel">
+              <header className="admin-crawler-panel__head">
+                <span className="admin-crawler-panel__icon">
+                  <Activity size={15} />
+                </span>
+                <div>
+                  <strong>运行参数</strong>
+                  <span>抓取数量、代理和上传目标</span>
+                </div>
+              </header>
+              <div className="admin-crawler-params">
+                <div className="admin-form__row">
+                  <label htmlFor="crawler-target">每次新增视频数</label>
+                  <input
+                    id="crawler-target"
+                    type="number"
+                    min={1}
+                    value={form.targetNew}
+                    onChange={(e) => set("targetNew", e.target.value)}
+                    placeholder="10"
+                  />
+                </div>
+                <div className="admin-form__row">
+                  <label htmlFor="crawler-proxy">代理地址</label>
+                  <input
+                    id="crawler-proxy"
+                    value={form.proxy}
+                    onChange={(e) => {
+                      set("proxy", e.target.value);
+                      setTestResult(null);
+                    }}
+                    placeholder="http://127.0.0.1:7890"
+                  />
+                </div>
+                <Spider91UploadTargetField
+                  value={form.uploadDriveId}
+                  onChange={(value) => set("uploadDriveId", value)}
+                  uploadTargets={uploadTargets}
+                />
+              </div>
+            </section>
           </div>
-        </section>
+        </div>
       </div>
     </Modal>
+  );
+}
+
+function CrawlerEditorSummaryItem({
+  label,
+  value,
+  tone,
+  icon,
+}: {
+  label: string;
+  value: string;
+  tone: "ok" | "error" | "info" | "muted";
+  icon: ReactNode;
+}) {
+  return (
+    <div className={`admin-crawler-editor-status is-${tone}`}>
+      <span className="admin-crawler-editor-status__icon">{tone === "ok" ? <Check size={13} /> : icon}</span>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   );
 }
 

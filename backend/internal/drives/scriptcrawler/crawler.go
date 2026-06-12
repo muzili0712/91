@@ -43,6 +43,8 @@ type CrawlerConfig struct {
 	CrawlerName     string
 	SourceKind      string
 	PythonPath      string
+	FFmpegPath      string
+	FFprobePath     string
 	ScriptPath      string
 	WorkDir         string
 	CommonThumbDir  string
@@ -61,6 +63,12 @@ type Crawler struct {
 func NewCrawler(cfg CrawlerConfig) *Crawler {
 	if strings.TrimSpace(cfg.PythonPath) == "" {
 		cfg.PythonPath = "python3"
+	}
+	if strings.TrimSpace(cfg.FFmpegPath) == "" {
+		cfg.FFmpegPath = "ffmpeg"
+	}
+	if strings.TrimSpace(cfg.FFprobePath) == "" {
+		cfg.FFprobePath = "ffprobe"
 	}
 	if cfg.DownloadTimeout <= 0 {
 		cfg.DownloadTimeout = 30 * time.Minute
@@ -525,6 +533,10 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("video: %w", err)
 	}
+	if err := c.validateDownloadedVideo(ctx, videoPath); err != nil {
+		_ = os.Remove(videoPath)
+		return false, fmt.Errorf("video invalid: %w", err)
+	}
 
 	now := time.Now()
 	title := strings.TrimSpace(item.Title)
@@ -635,6 +647,30 @@ func (c *Crawler) materializeMedia(ctx context.Context, ref MediaRef, dst, refer
 	return 0, nil
 }
 
+func (c *Crawler) validateDownloadedVideo(ctx context.Context, path string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	args := []string{
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=codec_type",
+		"-of", "csv=p=0",
+		path,
+	}
+	out, err := exec.CommandContext(ctx, c.cfg.FFprobePath, args...).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("ffprobe: %s", msg)
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "video") {
+		return errors.New("ffprobe: no video stream")
+	}
+	return nil
+}
+
 func (c *Crawler) copyLocalOutput(src, dst string) (int64, error) {
 	outputRoot, err := filepath.Abs(c.cfg.Driver.OutputDir())
 	if err != nil {
@@ -671,6 +707,9 @@ func (c *Crawler) downloadAtomic(ctx context.Context, ref MediaRef, dst, referer
 	}
 	if _, err := url.Parse(src); err != nil {
 		return 0, fmt.Errorf("parse url: %w", err)
+	}
+	if looksLikeHLSURL(src) {
+		return c.downloadHLSAtomic(ctx, ref, dst, referer)
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return 0, err
@@ -722,6 +761,126 @@ func (c *Crawler) downloadAtomic(ctx context.Context, ref MediaRef, dst, referer
 		return 0, err
 	}
 	return written, nil
+}
+
+func (c *Crawler) downloadHLSAtomic(ctx context.Context, ref MediaRef, dst, referer string) (int64, error) {
+	src := strings.TrimSpace(ref.URL)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return 0, err
+	}
+	tmp := dst + ".part"
+	_ = os.Remove(tmp)
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+	}
+	headers := mediaRequestHeaders(ref, referer)
+	if ua := strings.TrimSpace(headers.Get("User-Agent")); ua != "" {
+		args = append(args, "-user_agent", ua)
+	}
+	if h := ffmpegHeaderBlock(headers); h != "" {
+		args = append(args, "-headers", h)
+	}
+	args = append(args,
+		"-i", src,
+		"-c", "copy",
+		"-bsf:a", "aac_adtstoasc",
+		"-movflags", "+faststart",
+		"-f", "mp4",
+		tmp,
+	)
+	out, err := exec.CommandContext(ctx, c.cfg.FFmpegPath, args...).CombinedOutput()
+	if err != nil {
+		_ = os.Remove(tmp)
+		return 0, mediaCommandError("ffmpeg hls", err, out)
+	}
+	info, err := os.Stat(tmp)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return 0, err
+	}
+	if info.IsDir() || info.Size() <= 0 {
+		_ = os.Remove(tmp)
+		return 0, errors.New("empty hls output")
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func looksLikeHLSURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err == nil && u != nil && strings.EqualFold(path.Ext(u.Path), ".m3u8") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(raw), ".m3u8")
+}
+
+func mediaRequestHeaders(ref MediaRef, referer string) http.Header {
+	headers := make(http.Header)
+	headers.Set("User-Agent", defaultUserAgent)
+	if referer != "" {
+		headers.Set("Referer", referer)
+	}
+	for k, v := range ref.Headers {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		headers.Set(k, v)
+	}
+	return headers
+}
+
+func ffmpegHeaderBlock(headers http.Header) string {
+	var b strings.Builder
+	for k, values := range headers {
+		k = strings.TrimSpace(k)
+		if k == "" || strings.EqualFold(k, "User-Agent") {
+			continue
+		}
+		for _, v := range values {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.WriteString(v)
+			b.WriteString("\r\n")
+		}
+	}
+	return b.String()
+}
+
+func mediaCommandError(tool string, err error, output []byte) error {
+	msg := strings.TrimSpace(redactMediaURLs(string(output)))
+	if msg == "" {
+		return fmt.Errorf("%s: %w", tool, err)
+	}
+	return fmt.Errorf("%s: %w: %s", tool, err, msg)
+}
+
+func redactMediaURLs(text string) string {
+	fields := strings.Fields(text)
+	for i, field := range fields {
+		if strings.HasPrefix(field, "http://") || strings.HasPrefix(field, "https://") {
+			suffix := ""
+			for len(field) > 0 {
+				last := field[len(field)-1]
+				if last != '.' && last != ',' && last != ';' && last != ')' {
+					break
+				}
+				suffix = string(last) + suffix
+				field = field[:len(field)-1]
+			}
+			fields[i] = "https://<redacted>" + suffix
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 func configureExplicitProxy(transport *http.Transport, raw string) error {

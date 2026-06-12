@@ -144,6 +144,7 @@ test("admin modals and action footers adapt on mobile", () => {
   // .admin-modal 桌面段已用 `width: min(620px, 100%)`，窄屏自然 100%；mobile 段
   // 只重写 max-height，所以这里断桌面规则即可。
   assert.match(ruleBody(adminCss, ".admin-modal"), /width\s*:\s*min\(\d+px,\s*100%\)/);
+  assert.match(ruleBody(adminCss, ".admin-modal.admin-modal--crawler"), /width\s*:\s*min\(1080px,\s*100%\)/);
   // 多按钮 footer 在 mobile 下要换行避免溢出。
   assert.match(allRuleBodies(css, ".admin-modal__footer"), /flex-wrap\s*:\s*wrap/);
   // 删除/放弃类确认弹窗在 mobile 下不能跟随通用 modal stretch 到顶部。

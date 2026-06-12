@@ -200,6 +200,7 @@ export type AdminCrawler = {
   status: string;
   lastError?: string;
   scriptPath: string;
+  scriptSourceUrl?: string;
   proxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
@@ -226,6 +227,7 @@ export type AdminCrawler = {
 export type UpsertCrawlerInput = {
   id?: string;
   scriptPath: string;
+  scriptSourceUrl?: string;
   proxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
@@ -234,6 +236,7 @@ export type UpsertCrawlerInput = {
 export type ImportCrawlerScriptResult = {
   scriptPath: string;
   name: string;
+  sourceUrl?: string;
 };
 
 export type CrawlerDryRunItem = {

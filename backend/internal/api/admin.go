@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -636,6 +637,7 @@ type crawlerDTO struct {
 	Status                      string           `json:"status"`
 	LastError                   string           `json:"lastError,omitempty"`
 	ScriptPath                  string           `json:"scriptPath"`
+	ScriptSourceURL             string           `json:"scriptSourceUrl,omitempty"`
 	Proxy                       string           `json:"proxy,omitempty"`
 	TargetNew                   string           `json:"targetNew,omitempty"`
 	UploadDriveID               string           `json:"uploadDriveId,omitempty"`
@@ -660,11 +662,12 @@ type crawlerDTO struct {
 }
 
 type upsertCrawlerReq struct {
-	ID            string `json:"id"`
-	ScriptPath    string `json:"scriptPath"`
-	Proxy         string `json:"proxy"`
-	TargetNew     string `json:"targetNew"`
-	UploadDriveID string `json:"uploadDriveId"`
+	ID              string `json:"id"`
+	ScriptPath      string `json:"scriptPath"`
+	ScriptSourceURL string `json:"scriptSourceUrl"`
+	Proxy           string `json:"proxy"`
+	TargetNew       string `json:"targetNew"`
+	UploadDriveID   string `json:"uploadDriveId"`
 }
 
 func (a *AdminServer) handleListCrawlers(w http.ResponseWriter, r *http.Request) {
@@ -722,6 +725,7 @@ func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, assets catalog.Crawle
 		Status:                      d.Status,
 		LastError:                   d.LastError,
 		ScriptPath:                  strings.TrimSpace(d.Credentials["script_path"]),
+		ScriptSourceURL:             strings.TrimSpace(d.Credentials["script_source_url"]),
 		Proxy:                       strings.TrimSpace(d.Credentials["proxy"]),
 		TargetNew:                   strings.TrimSpace(d.Credentials["target_new"]),
 		UploadDriveID:               strings.TrimSpace(d.Credentials["upload_drive_id"]),
@@ -787,10 +791,11 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 	}
 	scriptPath := strings.TrimSpace(body.ScriptPath)
 	incoming := map[string]string{
-		"script_path":     scriptPath,
-		"proxy":           strings.TrimSpace(body.Proxy),
-		"target_new":      strings.TrimSpace(body.TargetNew),
-		"upload_drive_id": strings.TrimSpace(body.UploadDriveID),
+		"script_path":       scriptPath,
+		"script_source_url": strings.TrimSpace(body.ScriptSourceURL),
+		"proxy":             strings.TrimSpace(body.Proxy),
+		"target_new":        strings.TrimSpace(body.TargetNew),
+		"upload_drive_id":   strings.TrimSpace(body.UploadDriveID),
 	}
 	for k, v := range incoming {
 		creds[k] = v
@@ -966,15 +971,19 @@ func (a *AdminServer) handleImportCrawlerScriptFile(w http.ResponseWriter, r *ht
 	if header != nil && strings.TrimSpace(header.Filename) != "" {
 		name = header.Filename
 	}
-	scriptPath, err := a.saveCrawlerScript(r.Context(), name, file, maxCrawlerScriptBytes)
+	if _, err := safeCrawlerScriptFileName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// 先读入并校验元信息，再落盘，避免坏脚本覆盖同名旧脚本
+	data, meta, err := readCrawlerScript(file, maxCrawlerScriptBytes)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	meta, err := scriptcrawler.ReadMetadata(scriptPath)
+	scriptPath, err := a.saveCrawlerScript(r.Context(), name, bytes.NewReader(data), maxCrawlerScriptBytes)
 	if err != nil {
-		_ = os.Remove(scriptPath)
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("脚本元信息无效: %w", err))
+		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"scriptPath": scriptPath, "name": meta.Name})
@@ -996,12 +1005,13 @@ func (a *AdminServer) handleImportCrawlerScriptURL(w http.ResponseWriter, r *htt
 		writeErr(w, http.StatusBadRequest, errors.New("脚本链接仅支持 http:// 或 https://"))
 		return
 	}
+	downloadURL := crawlerScriptDownloadURL(u)
 
 	client := a.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, downloadURL.String(), nil)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -1024,23 +1034,73 @@ func (a *AdminServer) handleImportCrawlerScriptURL(w http.ResponseWriter, r *htt
 
 	name := strings.TrimSpace(body.FileName)
 	if name == "" {
-		name = path.Base(u.Path)
+		name = path.Base(downloadURL.Path)
 	}
 	if name == "." || name == "/" || name == "" {
 		name = "crawler.py"
 	}
-	scriptPath, err := a.saveCrawlerScript(r.Context(), name, resp.Body, maxCrawlerScriptBytes)
+	if _, err := safeCrawlerScriptFileName(name); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// 先读入并校验元信息，再落盘；从原链接更新时远端脚本损坏不会影响本地旧脚本
+	data, meta, err := readCrawlerScript(resp.Body, maxCrawlerScriptBytes)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	meta, err := scriptcrawler.ReadMetadata(scriptPath)
+	scriptPath, err := a.saveCrawlerScript(r.Context(), name, bytes.NewReader(data), maxCrawlerScriptBytes)
 	if err != nil {
-		_ = os.Remove(scriptPath)
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("脚本元信息无效: %w", err))
+		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"scriptPath": scriptPath, "name": meta.Name})
+	writeJSON(w, http.StatusOK, map[string]any{"scriptPath": scriptPath, "name": meta.Name, "sourceUrl": downloadURL.String()})
+}
+
+func crawlerScriptDownloadURL(u *url.URL) *url.URL {
+	if raw, ok := githubRawCrawlerScriptURL(u); ok {
+		return raw
+	}
+	return u
+}
+
+func githubRawCrawlerScriptURL(u *url.URL) (*url.URL, bool) {
+	host := strings.ToLower(u.Hostname())
+	if host != "github.com" && host != "www.github.com" {
+		return nil, false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 5 {
+		return nil, false
+	}
+	if parts[0] == "" || parts[1] == "" || parts[3] == "" || (parts[2] != "blob" && parts[2] != "raw") {
+		return nil, false
+	}
+	rawParts := append([]string{parts[0], parts[1], parts[3]}, parts[4:]...)
+	return &url.URL{
+		Scheme: "https",
+		Host:   "raw.githubusercontent.com",
+		Path:   "/" + strings.Join(rawParts, "/"),
+	}, true
+}
+
+// readCrawlerScript 把脚本内容读入内存并校验大小和元信息，返回内容和元信息。
+func readCrawlerScript(r io.Reader, maxBytes int64) ([]byte, scriptcrawler.Metadata, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, scriptcrawler.Metadata{}, err
+	}
+	if len(data) == 0 {
+		return nil, scriptcrawler.Metadata{}, errors.New("脚本文件为空")
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, scriptcrawler.Metadata{}, fmt.Errorf("脚本文件不能超过 %d KiB", maxBytes/1024)
+	}
+	meta, err := scriptcrawler.ExtractMetadata(string(data))
+	if err != nil {
+		return nil, scriptcrawler.Metadata{}, fmt.Errorf("脚本元信息无效: %w", err)
+	}
+	return data, meta, nil
 }
 
 func (a *AdminServer) saveCrawlerScript(ctx context.Context, name string, r io.Reader, maxBytes int64) (string, error) {

@@ -24,6 +24,7 @@ const (
 	defaultDryRunTimeout  = 2 * time.Minute
 	dryRunLogTailLines    = 60
 	dryRunMediaProbeLimit = 20 * time.Second
+	dryRunStopGrace       = 100 * time.Millisecond
 )
 
 type DryRunConfig struct {
@@ -250,9 +251,19 @@ func DryRun(ctx context.Context, cfg DryRunConfig) *DryRunResult {
 			break
 		}
 	}
-	// 拿够了就停掉脚本，避免它继续翻页。
-	_ = killDryRunProcess(cmd)
-	_ = cmd.Wait()
+	// 拿够了就停掉脚本，避免它继续翻页。给已经自然结束的脚本一个很短
+	// 的宽限期，让 stderr 日志先被管道读完，避免 dry-run 回显偶发为空。
+	waitDone := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(dryRunStopGrace):
+		_ = killDryRunProcess(cmd)
+		<-waitDone
+	}
 	<-stderrDone
 
 	logMu.Lock()

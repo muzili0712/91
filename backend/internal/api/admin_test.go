@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1455,6 +1456,29 @@ func TestHandleImportCrawlerScriptURL(t *testing.T) {
 	}
 	if string(data) != "CRAWLER_NAME = \"URL Crawler\"\n# crawler from url\n" {
 		t.Fatalf("script content = %q", string(data))
+	}
+}
+
+func TestCrawlerScriptDownloadURLConvertsGitHubBlob(t *testing.T) {
+	input, err := url.Parse("https://github.com/Just-Spider/SpiderFor91/blob/main/91Porn/91Porn.py")
+	if err != nil {
+		t.Fatalf("parse input: %v", err)
+	}
+	got := crawlerScriptDownloadURL(input)
+	want := "https://raw.githubusercontent.com/Just-Spider/SpiderFor91/main/91Porn/91Porn.py"
+	if got.String() != want {
+		t.Fatalf("download URL = %q, want %q", got.String(), want)
+	}
+}
+
+func TestCrawlerScriptDownloadURLKeepsNonGitHubURL(t *testing.T) {
+	input, err := url.Parse("https://example.com/crawlers/demo.py")
+	if err != nil {
+		t.Fatalf("parse input: %v", err)
+	}
+	got := crawlerScriptDownloadURL(input)
+	if got.String() != input.String() {
+		t.Fatalf("download URL = %q, want original %q", got.String(), input.String())
 	}
 }
 

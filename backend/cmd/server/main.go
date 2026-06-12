@@ -994,6 +994,8 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 		CrawlerName:    d.Name,
 		SourceKind:     sourceKind,
 		PythonPath:     pythonPath,
+		FFmpegPath:     a.cfg.Preview.FFmpegPath,
+		FFprobePath:    a.cfg.Preview.FFprobePath,
 		ScriptPath:     scriptPath,
 		WorkDir:        workDir,
 		CommonThumbDir: a.commonThumbsDir(),
