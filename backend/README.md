@@ -23,7 +23,6 @@ internal/
     onedrive/               OneDrive（OpenList 在线续期 + Microsoft Graph 文件接口）
     googledrive/            Google Drive（OpenList 在线续期 + Google Drive API；播放走后端代理）
     localstorage/           本地目录扫描（服务器已有视频目录）
-    scriptcrawler/          通用脚本爬虫输出的本地媒体适配层
   scanner/                  扫目录 → 落库
   preview/                  ffmpeg 抽封面和生成多段预览视频
   proxy/                    /p/stream/*、/p/preview/* 代理
@@ -80,12 +79,6 @@ npm run preview     前端 9191，无热更新
 go run ./cmd/server 后端 9192
 ```
 
-## 爬虫脚本
-
-爬虫现在是独立后台栏目 `/admin/crawlers`，不再作为“网盘/存储类型”配置。脚本负责发现视频，后端负责去重、下载、入库、封面、预览视频和视频指纹。
-
-脚本协议见 [docs/crawler-protocol.md](../docs/crawler-protocol.md)。后台支持上传 `.py` 文件或通过 HTTP(S) 脚本链接导入，导入后的脚本会保存到数据目录旁的 `crawler-scripts/`。脚本必须声明 `CRAWLER_NAME`，后台会自动读取它作为爬虫名称。项目不内置任何爬虫脚本，所有爬虫都由用户自行导入。
-
 ## 添加一个盘
 
 推荐在前端管理后台 `/admin/drives` 新增网盘。保存后会立即挂载并触发扫描；视频结果可在 `/admin/videos` 按网盘查看，每页 100 条，页面会同时显示各网盘预览视频已生成、待生成、失败数量。
@@ -127,7 +120,7 @@ go run ./cmd/server 后端 9192
 
 OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/renewapi` 在线刷新 token，不需要配置 Azure 应用的 `client_id` / `client_secret` / `redirect_uri`。后台新建 OneDrive 时只需要填 OpenList 代刷得到的 `refresh_token`；服务端会默认挂载根目录并自动回写新 token。
 
-Google Drive 默认按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/renewapi` 刷新 token。后台新建 Google Drive 时只需要填 OpenList Google Drive 获取到的 `refresh_token`。如果不想依赖 OpenList 在线 API，可以关闭“使用 OpenList 在线续期 API”，并填写同一个 Google OAuth 客户端授权得到的 `refresh_token`、`client_id`、`client_secret`，服务端会直接请求 Google OAuth token 接口续期。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。91 爬虫迁移到 Google Drive 时使用 Google Drive resumable upload session 上传，并把上传文件的 MD5 写入 catalog 用于去重。
+Google Drive 默认按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/renewapi` 刷新 token。后台新建 Google Drive 时只需要填 OpenList Google Drive 获取到的 `refresh_token`。如果不想依赖 OpenList 在线 API，可以关闭“使用 OpenList 在线续期 API”，并填写同一个 Google OAuth 客户端授权得到的 `refresh_token`、`client_id`、`client_secret`，服务端会直接请求 Google OAuth token 接口续期。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。
 
 ## 文件名约定
 
@@ -152,7 +145,7 @@ Google Drive 默认按 OpenList 在线 API 调用 `https://api.oplist.org/google
 
 1. 同一网盘同一文件按 `(drive_id, file_id)` 形成稳定视频 ID，重复扫描只更新同一行。
 2. 扫描时优先按网盘侧 `content_hash` 去重；没有 hash 时退化为 `file_name + size_bytes`。
-3. 扫描、爬虫、本地上传或服务启动挂载网盘后，后台指纹 worker 会异步读取视频的少量 Range 片段，生成 `sampled_sha256`。前台列表、首页、搜索、推荐会按 `size_bytes + sampled_sha256` 只展示最早入库的 canonical 视频。
+3. 扫描、本地上传或服务启动挂载网盘后，后台指纹 worker 会异步读取视频的少量 Range 片段，生成 `sampled_sha256`。前台列表、首页、搜索、推荐会按 `size_bytes + sampled_sha256` 只展示最早入库的 canonical 视频。
 
 `sampled_sha256` 是文件级去重：适合识别同一个视频文件被复制到 115 / PikPak / OneDrive / Google Drive 等不同网盘的情况。它不会删除任何网盘文件，也不用于识别转码、裁剪、加水印后的同源视频。
 
