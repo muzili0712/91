@@ -71,7 +71,7 @@ type AdminServer struct {
 	// enabled=true 时上层应该重新把 pending 预览视频入队（类似旧的全局开关从关到开）；
 	// enabled=false 时通常不用做事 —— worker 入队前会再次查 catalog，自然停止。
 	OnTeaserEnabledChanged func(driveID string, enabled bool)
-	// Theme 读写（"dark" | "pink"）
+	// Theme 读写（"dark" | "pink" | "sky"）
 	GetTheme func() string
 	SetTheme func(theme string) error
 	// Spider91 → 115/123/PikPak/OneDrive/Google Drive/联通网盘 上传目标 drive ID 读写

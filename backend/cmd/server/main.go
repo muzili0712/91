@@ -352,7 +352,7 @@ type App struct {
 	// 串行化可以避免启动后台挂载和手动扫盘按需挂载同一个 drive 时重复创建 worker。
 	driveAttachMu sync.Mutex
 
-	// 全站主题（"dark" | "pink"），从 DB 读
+	// 全站主题（"dark" | "pink" | "sky"），从 DB 读
 	theme string
 	// 显式指定的 spider91 上传目标 drive ID。
 	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115/p123/onedrive/wopan drive。
@@ -451,7 +451,7 @@ func (a *App) Theme() string {
 
 // SetTheme 切换并持久化主题；未知值会返回错误。
 func (a *App) SetTheme(ctx context.Context, theme string) error {
-	if theme != "dark" && theme != "pink" {
+	if theme != "dark" && theme != "pink" && theme != "sky" {
 		return fmt.Errorf("unsupported theme %q", theme)
 	}
 	a.mu.Lock()
@@ -470,7 +470,7 @@ func (a *App) loadTheme(ctx context.Context) {
 		a.mu.Unlock()
 		return
 	}
-	if v != "pink" && v != "dark" {
+	if v != "pink" && v != "dark" && v != "sky" {
 		v = "dark"
 	}
 	a.mu.Lock()

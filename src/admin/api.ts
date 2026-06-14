@@ -632,7 +632,7 @@ export function deleteTag(id: number) {
 
 // ---------- Settings ----------
 
-export type Theme = "dark" | "pink";
+export type Theme = "dark" | "pink" | "sky";
 
 export type Settings = {
   theme: Theme;
